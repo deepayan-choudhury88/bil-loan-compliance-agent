@@ -1,0 +1,56 @@
+name: Go CI Pipeline
+
+# Trigger the workflow on pushes to main OR pull requests targeting main
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  verify:
+    name: Format, Vet, and Lint
+    runs-on: ubuntu-latest
+    
+    # Set the working directory to where your Go code lives
+    defaults:
+      run:
+        working-directory: ./pipeline
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Update this if you are using a different Go version
+          cache-dependency-path: ./pipeline/go.sum
+
+      - name: Download Go Modules
+        run: go mod download
+
+      - name: Check Formatting (go fmt)
+        # This checks if any files need formatting. If so, it lists them and fails the build.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "❌ The following files are not formatted properly:"
+            echo "$unformatted"
+            echo "👉 Please run 'go fmt ./...' locally and commit the changes."
+            exit 1
+          else
+            echo "✅ All files are properly formatted."
+          fi
+
+      - name: Run Static Analysis (go vet)
+        # Examines Go source code and reports suspicious constructs (e.g., Printf calls with wrong arguments)
+        run: go vet ./...
+
+      - name: Run GolangCI-Lint
+        # The industry standard linter that bundles dozens of Go linters into one tool
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: ./pipeline
+          args: --timeout=5m
