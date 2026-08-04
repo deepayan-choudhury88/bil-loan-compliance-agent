@@ -121,7 +121,9 @@ func main() {
 			loanValueEUR = loanValue
 		} else {
 			rate, exists := rates[currency]
-			if !exists { continue }
+			if !exists {
+				continue
+			}
 			loanValueEUR = loanValue / rate
 		}
 
@@ -150,7 +152,9 @@ func main() {
 		jsonData, _ := json.Marshal(reqBody)
 
 		resp, err := http.Post("http://localhost:8181/v1/data/compliance", "application/json", bytes.NewBuffer(jsonData))
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
 		var opaResult OPAResponse
 		if err := json.NewDecoder(resp.Body).Decode(&opaResult); err != nil {
@@ -162,10 +166,16 @@ func main() {
 		if !opaResult.Result.Allow {
 			report.TotalFailures++
 			violationsStr := strings.Join(opaResult.Result.Violations, "; ")
-			
-			if strings.Contains(violationsStr, "Rule 1") { report.Rule1Fails++ }
-			if strings.Contains(violationsStr, "Rule 2") { report.Rule2Fails++ }
-			if strings.Contains(violationsStr, "Rule 3") { report.Rule3Fails++ }
+
+			if strings.Contains(violationsStr, "Rule 1") {
+				report.Rule1Fails++
+			}
+			if strings.Contains(violationsStr, "Rule 2") {
+				report.Rule2Fails++
+			}
+			if strings.Contains(violationsStr, "Rule 3") {
+				report.Rule3Fails++
+			}
 
 			details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", loanValue, currency, assetValue, currency, hqCountry)
 
