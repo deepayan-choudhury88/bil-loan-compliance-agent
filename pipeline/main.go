@@ -178,7 +178,6 @@ func main() {
 		}
 
 		rowCount++
-		if rowCount >= 100 { break }
 	}
 
 	fmt.Println("✅ Success! Compliance processing completed.")
