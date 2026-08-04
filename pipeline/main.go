@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -100,7 +101,20 @@ func main() {
 		FailedLoans: []FailedLoan{},
 	}
 
-	rowCount := 0
+	// CONCURRENCY UPGRADES:
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	// Semaphore to limit concurrent HTTP requests to 50 so we don't crash OPA
+	sem := make(chan struct{}, 50)
+
+	// Reusable HTTP client so we don't exhaust local ports
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 50,
+		},
+		Timeout: 5 * time.Second,
+	}
+
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -110,11 +124,15 @@ func main() {
 			continue
 		}
 
+		// Parse row variables safely outside the goroutine
+		loanID := record[0]
+		companyName := record[1]
+		hqCountry := record[2]
+		assetDesc := record[3]
 		assetValue, _ := strconv.ParseFloat(record[4], 64)
+		assetOwner := record[5]
 		loanValue, _ := strconv.ParseFloat(record[6], 64)
 		currency := record[7]
-		hqCountry := record[2]
-		companyName := record[1]
 
 		var loanValueEUR float64
 		if currency == "EUR" {
@@ -132,63 +150,76 @@ func main() {
 			expectedCurrency = "UNKNOWN"
 		}
 
-		report.Portfolio[companyName] += loanValueEUR
-		report.TotalLoansChecked++
+		// Start a Goroutine for this row
+		wg.Add(1)
+		sem <- struct{}{} // Claim a slot in the semaphore (max 50)
 
-		loanInput := LoanInput{
-			LoanID:           record[0],
-			CompanyName:      companyName,
-			HQCountry:        hqCountry,
-			AssetDescription: record[3],
-			AssetValue:       assetValue,
-			AssetOwner:       record[5],
-			LoanValue:        loanValue,
-			LoanCurrency:     currency,
-			LoanValueEUR:     loanValueEUR,
-			ExpectedCurrency: expectedCurrency,
-		}
+		go func(lID, cName, hq, aDesc, aOwner, cur, expCur string, aVal, lVal, lValEUR float64) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release the slot when done
 
-		reqBody := map[string]interface{}{"input": loanInput}
-		jsonData, _ := json.Marshal(reqBody)
+			loanInput := LoanInput{
+				LoanID:           lID,
+				CompanyName:      cName,
+				HQCountry:        hq,
+				AssetDescription: aDesc,
+				AssetValue:       aVal,
+				AssetOwner:       aOwner,
+				LoanValue:        lVal,
+				LoanCurrency:     cur,
+				LoanValueEUR:     lValEUR,
+				ExpectedCurrency: expCur,
+			}
 
-		resp, err := http.Post("http://localhost:8181/v1/data/compliance", "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			continue
-		}
+			reqBody := map[string]interface{}{"input": loanInput}
+			jsonData, _ := json.Marshal(reqBody)
 
-		var opaResult OPAResponse
-		if err := json.NewDecoder(resp.Body).Decode(&opaResult); err != nil {
+			resp, err := client.Post("http://localhost:8181/v1/data/compliance", "application/json", bytes.NewBuffer(jsonData))
+			if err != nil {
+				return
+			}
+
+			var opaResult OPAResponse
+			if err := json.NewDecoder(resp.Body).Decode(&opaResult); err != nil {
+				resp.Body.Close()
+				return
+			}
 			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
 
-		if !opaResult.Result.Allow {
-			report.TotalFailures++
-			violationsStr := strings.Join(opaResult.Result.Violations, "; ")
+			// MUTEX LOCK: Safely update the shared report variables
+			mu.Lock()
+			report.Portfolio[cName] += lValEUR
+			report.TotalLoansChecked++
 
-			if strings.Contains(violationsStr, "Rule 1") {
-				report.Rule1Fails++
+			if !opaResult.Result.Allow {
+				report.TotalFailures++
+				violationsStr := strings.Join(opaResult.Result.Violations, "; ")
+
+				if strings.Contains(violationsStr, "Rule 1") {
+					report.Rule1Fails++
+				}
+				if strings.Contains(violationsStr, "Rule 2") {
+					report.Rule2Fails++
+				}
+				if strings.Contains(violationsStr, "Rule 3") {
+					report.Rule3Fails++
+				}
+
+				details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", lVal, cur, aVal, cur, hq)
+
+				report.FailedLoans = append(report.FailedLoans, FailedLoan{
+					LoanID:      lID,
+					Company:     cName,
+					Violations:  violationsStr,
+					LoanDetails: details,
+				})
 			}
-			if strings.Contains(violationsStr, "Rule 2") {
-				report.Rule2Fails++
-			}
-			if strings.Contains(violationsStr, "Rule 3") {
-				report.Rule3Fails++
-			}
-
-			details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", loanValue, currency, assetValue, currency, hqCountry)
-
-			report.FailedLoans = append(report.FailedLoans, FailedLoan{
-				LoanID:      loanInput.LoanID,
-				Company:     loanInput.CompanyName,
-				Violations:  violationsStr,
-				LoanDetails: details,
-			})
-		}
-
-		rowCount++
+			mu.Unlock() // MUTEX UNLOCK
+		}(loanID, companyName, hqCountry, assetDesc, assetOwner, currency, expectedCurrency, assetValue, loanValue, loanValueEUR)
 	}
+
+	fmt.Println("Processing all rows concurrently... please wait.")
+	wg.Wait() // Wait for all goroutines to finish
 
 	fmt.Println("✅ Success! Compliance processing completed.")
 }
