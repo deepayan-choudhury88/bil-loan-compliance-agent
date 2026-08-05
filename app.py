@@ -57,7 +57,6 @@ import html
 import io
 import json
 import os
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -162,6 +161,29 @@ MIN_VALUE_PERCENTILE_DEMO = 10  # Rule 1, demo data only:
 # Replace with a fixed EUR
 # amount (e.g. MIN_LOAN_VALUE_EUR
 # = 50_000) once you have real data.
+
+# Human-readable descriptions of the three rules exactly as enforced by
+# policy/compliance.rego (the actual OPA policy the Go pipeline evaluates
+# against, in "custom" mode). Shown in the UI's "View Compliance Rules"
+# popover and as tooltips on the R1/R2/R3 badges, so reviewers don't have
+# to go dig through the .rego file to know what each rule actually checks.
+RULE_DEFINITIONS = {
+    "R1": {
+        "title": "Rule 1 \u2014 Minimum Loan Value",
+        "description": "The loan's EUR-converted value must exceed 25,000 EUR.",
+        "on_fail": "The loan is out of scope entirely \u2014 recommended action is to remove it. Rules 2 and 3 are not evaluated for remediation purposes.",
+    },
+    "R2": {
+        "title": "Rule 2 \u2014 Currency Match",
+        "description": "The loan's settlement currency must match the currency expected for the borrower's HQ country.",
+        "on_fail": "Recommended action is to correct the loan's currency to the expected one.",
+    },
+    "R3": {
+        "title": "Rule 3 \u2014 Asset Coverage",
+        "description": "The pledged collateral's value must be at least 50% of the loan value.",
+        "on_fail": "The AI suggestion agent recommends an alternative asset from the company's records, if one meets the threshold.",
+    },
+}
 
 # The five possible "review states" a loan can be in once a human/agent has
 # looked at a compliance failure. "Clean / Passed" is reserved for loans
@@ -347,16 +369,37 @@ def inject_css() -> None:
         }}
         .lcs-title {{ font-size: 26px; font-weight: 800; color: {c['text_primary']}; margin: 0; line-height: 1.1; }}
         .lcs-subtitle {{ color: {c['text_secondary']}; font-size: 12.5px; margin-top: 2px; }}
-        .lcs-report-meta {{ color: {c['text_secondary']}; font-size: 11.5px; margin: 2px 0 0 2px; }}
+        /* Report-freshness banner: rendered ABOVE the header card so it's
+           the very first thing a reviewer sees, not a small caption they
+           have to hunt for. Amber/warning tint (not the app's usual
+           indigo/blue) deliberately makes it stand out from everything
+           else on the page. */
+        .lcs-freshness-banner {{
+            background: {c['orange_soft']};
+            border: 1px solid #fcd9a0;
+            border-radius: 10px;
+            padding: 10px 18px;
+            margin-bottom: 10px;
+            font-size: 13.5px;
+            font-weight: 600;
+            color: {c['orange']};
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }}
+        .lcs-freshness-item {{ white-space: nowrap; }}
+        .lcs-freshness-sep {{ color: #e0b370; }}
+        .lcs-freshness-note {{ font-weight: 400; font-size: 12px; color: #a3701f; }}
         .lcs-pill {{
             display: inline-block; background: {c['indigo_soft']};
             border: 1px solid #cfc7fb; color: #4c3fb8;
             border-radius: 8px; padding: 8px 14px; font-weight: 600; font-size: 13.5px;
             white-space: nowrap;
         }}
-        /* Each stat chip (Total Audited / Failures / Remediated / FX Source)
-           is a flex item inside the header's horizontal container. flex:0 0
-           auto keeps it sized to its own content instead of being stretched
+        /* Each stat chip (Total Audited / Failures / Remediated) is a flex
+           item inside the header's horizontal container. flex:0 0 auto
+           keeps it sized to its own content instead of being stretched
            or shrunk by the flexbox - it just wraps onto a new line, as a
            whole unit, if the row runs out of width. */
         .lcs-stat-block {{ flex: 0 0 auto; white-space: nowrap; }}
@@ -494,8 +537,7 @@ def generate_demo_loans(n: int, seed: int) -> pd.DataFrame:
     n : int
         Number of loans to generate (the app calls this with n=100_000).
     seed : int
-        Random seed. Changing the seed (e.g. via the "Reset 100k" button)
-        produces a fresh random portfolio.
+        Random seed. Changing the seed produces a fresh random portfolio.
 
     Returns
     -------
@@ -891,13 +933,18 @@ def status_pill_html(review_state: str) -> str:
     return f'<span class="pill {css_class}">{label}</span>'
 
 
-def rule_badge_html(label: str, passed: bool, muted: bool = False) -> str:
+def rule_badge_html(label: str, passed: bool, muted: bool = False, tooltip: str = "") -> str:
     """Return a small coloured HTML badge (e.g. 'R1') showing pass/fail.
 
     When `muted` is True (Rule 1 already failed, so this loan is out of
     scope regardless of R2/R3), the badge is greyed out with a tooltip
     instead of showing red/green - its outcome no longer affects the
     loan's disposition.
+
+    `tooltip`, when given, is shown on hover via the HTML `title`
+    attribute (e.g. the rule's plain-English definition from
+    RULE_DEFINITIONS) - ignored when `muted` is True since that already
+    has its own explanatory tooltip.
     """
     if muted:
         return (
@@ -905,7 +952,8 @@ def rule_badge_html(label: str, passed: bool, muted: bool = False) -> str:
             f'title="Not applicable for remediation - loan already out of scope due to Rule 1">{label}</span>'
         )
     css_class = "rule-pass" if passed else "rule-fail"
-    return f'<span class="rule-badge {css_class}">{label}</span>'
+    title_attr = f' title="{html.escape(tooltip)}"' if tooltip else ""
+    return f'<span class="rule-badge {css_class}"{title_attr}>{label}</span>'
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -970,15 +1018,43 @@ def get_portfolio_data() -> pd.DataFrame:
     return apply_remediation_overrides(base_df)
 
 
-def reset_demo_data() -> None:
-    """Regenerate a brand-new random demo portfolio (the 'Reset 100k' button)."""
-    st.session_state.seed = random.randint(1, 10_000_000)
-    st.session_state.report_meta = None
-    st.session_state.loan_overrides = {}
-    st.session_state.custom_df = None
-    st.session_state.selected_ids = set()
-    st.session_state.page = 1
-    generate_demo_loans.clear()  # drop the cached DataFrame for the old seed
+def render_report_freshness_banner() -> None:
+    """
+    A full-width banner announcing WHEN this report was generated and which
+    FX rate snapshot ("as of" date) was used - rendered ABOVE the header so
+    it's the very first thing on the page, not something a reviewer has to
+    go looking for.
+
+    Only shown when the portfolio actually came from a live pipeline run
+    (DATA_SOURCE_MODE == "custom", see load_data_from_custom_source()) -
+    demo/CSV data has no real generation time or FX snapshot to report, so
+    report_meta stays None and this is skipped entirely rather than showing
+    a misleading/fabricated timestamp.
+    """
+    report_meta = st.session_state.get("report_meta")
+    if not report_meta:
+        return
+
+    generated_display = str(report_meta.get("generated_at_utc", "unknown"))
+    try:
+        generated_dt = datetime.fromisoformat(generated_display.replace("Z", "+00:00"))
+        generated_display = generated_dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        pass
+    fx_date_display = str(report_meta.get("fx_rate_date") or "unknown")
+
+    st.markdown(
+        '<div class="lcs-freshness-banner">'
+        '<span class="lcs-freshness-item">🕒 <b>Report generated:</b> '
+        f"{html.escape(generated_display)}</span>"
+        '<span class="lcs-freshness-sep">|</span>'
+        '<span class="lcs-freshness-item">💱 <b>FX rates as of:</b> '
+        f"{html.escape(fx_date_display)}</span>"
+        '<span class="lcs-freshness-note">(FX providers only publish rates for market days - '
+        "this may not be today)</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # =============================================================================
@@ -1058,24 +1134,19 @@ def render_header(df: pd.DataFrame) -> None:
             f'<div class="lcs-stat-value green">{remediated:,}</div></div>',
             unsafe_allow_html=True,
         )
-        st.markdown(
-            f'<div class="lcs-stat-block"><div class="lcs-stat-label">FX Source</div>'
-            f'<div class="lcs-stat-value blue" style="font-size:15px;">1 EUR = {FX_RATES["USD"]:.4f} USD</div></div>',
-            unsafe_allow_html=True,
-        )
 
         # -- action buttons ---------------------------------------------------
-        # Import CSV / Reset 100k / Export Audit CSV sit directly in the same
-        # outer container as everything else above (no nested sub-container).
-        # A nested st.container() defaults its own width to "stretch" - 100%
-        # of its parent - so wrapping these three in their own inner container
+        # Import CSV / Export Audit CSV sit directly in the same outer
+        # container as everything else above (no nested sub-container). A
+        # nested st.container() defaults its own width to "stretch" - 100%
+        # of its parent - so wrapping these in their own inner container
         # made THAT container claim a full line for itself and permanently
         # push the buttons onto row 2, no matter how much room was free.
         # Buttons/popovers default to a content-sized width instead, so left
         # as direct children here they simply sit inline and wrap onto a new
         # line only when the row actually runs out of space.
         #
-        # None of the three use use_container_width=True any more: that
+        # Neither of the two use use_container_width=True any more: that
         # stretched each button to fill its (shrinking) st.columns() slot,
         # which is what forced their labels to wrap letter-by-letter. Left
         # at their natural content width, they simply wrap as a whole group
@@ -1102,9 +1173,13 @@ def render_header(df: pd.DataFrame) -> None:
                 except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
                     st.error(f"Could not read CSV: {exc}")
 
-        if st.button("🔄 Reset 100k", key="reset_btn"):
-            reset_demo_data()
-            st.rerun()
+        with st.popover("📜 Compliance Rules"):
+            st.caption("The three deterministic rules every loan is checked against (policy/compliance.rego).")
+            for rule_key in ("R1", "R2", "R3"):
+                rule = RULE_DEFINITIONS[rule_key]
+                st.markdown(f"**{rule['title']}**")
+                st.markdown(rule["description"])
+                st.caption(f"If it fails: {rule['on_fail']}")
 
         st.download_button(
             "⬇️ Export Audit CSV",
@@ -1114,29 +1189,6 @@ def render_header(df: pd.DataFrame) -> None:
             type="primary",
             key="export_header_btn",
         )
-
-    # -- report generation / FX rate freshness -----------------------------
-    # Only shown when the portfolio actually came from a live pipeline run
-    # (DATA_SOURCE_MODE == "custom", see load_data_from_custom_source()) -
-    # demo/CSV data has no real generation time or FX snapshot to report,
-    # so report_meta stays None and this is skipped entirely rather than
-    # showing a misleading/fabricated timestamp.
-    report_meta = st.session_state.get("report_meta")
-    if report_meta:
-        generated_display = str(report_meta.get("generated_at_utc", "unknown"))
-        try:
-            generated_dt = datetime.fromisoformat(generated_display.replace("Z", "+00:00"))
-            generated_display = generated_dt.strftime("%Y-%m-%d %H:%M UTC")
-        except ValueError:
-            pass
-        fx_date_display = str(report_meta.get("fx_rate_date") or "unknown")
-        st.markdown(
-            f'<div class="lcs-report-meta">📄 Report generated: {html.escape(generated_display)}'
-            f' &nbsp;·&nbsp; 💱 FX rates as of {html.escape(fx_date_display)}'
-            f" (live rates don't always match today - providers only publish for market days)</div>",
-            unsafe_allow_html=True,
-        )
-
 
 # =============================================================================
 # 11. TAB 1: REVIEW WORKDESK
@@ -1516,9 +1568,13 @@ def _render_workdesk_row(row: pd.Series) -> None:
         # for THIS loan's remediation - it's being removed either way.
         rule1_failed = not row["rule1_pass"]
         st.markdown(
-            rule_badge_html("R1", row["rule1_pass"])
-            + rule_badge_html("R2", row["rule2_pass"], muted=rule1_failed)
-            + rule_badge_html("R3", row["rule3_pass"], muted=rule1_failed),
+            rule_badge_html("R1", row["rule1_pass"], tooltip=RULE_DEFINITIONS["R1"]["description"])
+            + rule_badge_html(
+                "R2", row["rule2_pass"], muted=rule1_failed, tooltip=RULE_DEFINITIONS["R2"]["description"]
+            )
+            + rule_badge_html(
+                "R3", row["rule3_pass"], muted=rule1_failed, tooltip=RULE_DEFINITIONS["R3"]["description"]
+            ),
             unsafe_allow_html=True,
         )
 
@@ -1889,15 +1945,27 @@ def render_opa_playground(df: pd.DataFrame) -> None:
 
             st.markdown("**Evaluation result:**")
             st.markdown(
-                rule_badge_html("R1 Min Value", bool(loan_row["rule1_pass"]) if rule1_present else True),
+                rule_badge_html(
+                    "R1 Min Value",
+                    bool(loan_row["rule1_pass"]) if rule1_present else True,
+                    tooltip=RULE_DEFINITIONS["R1"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
             st.markdown(
-                rule_badge_html("R2 Currency", bool(loan_row["rule2_pass"]) if rule2_present else True),
+                rule_badge_html(
+                    "R2 Currency",
+                    bool(loan_row["rule2_pass"]) if rule2_present else True,
+                    tooltip=RULE_DEFINITIONS["R2"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
             st.markdown(
-                rule_badge_html("R3 Asset Coverage", bool(loan_row["rule3_pass"]) if rule3_present else True),
+                rule_badge_html(
+                    "R3 Asset Coverage",
+                    bool(loan_row["rule3_pass"]) if rule3_present else True,
+                    tooltip=RULE_DEFINITIONS["R3"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
 
@@ -2002,6 +2070,7 @@ def main() -> None:
     init_session_state()
     portfolio_df = get_portfolio_data()
 
+    render_report_freshness_banner()
     render_header(portfolio_df)
 
     st.markdown('<div style="height:4px;"></div>', unsafe_allow_html=True)
