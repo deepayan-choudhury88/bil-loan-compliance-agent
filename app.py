@@ -399,6 +399,7 @@ def inject_css() -> None:
         }}
         .rule-pass {{ background: {c['green_soft']}; color: {c['green']}; }}
         .rule-fail {{ background: {c['red_soft']}; color: {c['red']}; }}
+        .rule-na {{ background: {c['grey_soft']}; color: {c['grey']}; opacity: 0.6; }}
 
         .cov-green {{ color: {c['green']}; font-weight: 700; }}
         .cov-red {{ color: {c['red']}; font-weight: 700; }}
@@ -855,8 +856,19 @@ def status_pill_html(review_state: str) -> str:
     return f'<span class="pill {css_class}">{label}</span>'
 
 
-def rule_badge_html(label: str, passed: bool) -> str:
-    """Return a small coloured HTML badge (e.g. 'R1') showing pass/fail."""
+def rule_badge_html(label: str, passed: bool, muted: bool = False) -> str:
+    """Return a small coloured HTML badge (e.g. 'R1') showing pass/fail.
+
+    When `muted` is True (Rule 1 already failed, so this loan is out of
+    scope regardless of R2/R3), the badge is greyed out with a tooltip
+    instead of showing red/green - its outcome no longer affects the
+    loan's disposition.
+    """
+    if muted:
+        return (
+            f'<span class="rule-badge rule-na" '
+            f'title="Not applicable for remediation - loan already out of scope due to Rule 1">{label}</span>'
+        )
     css_class = "rule-pass" if passed else "rule-fail"
     return f'<span class="rule-badge {css_class}">{label}</span>'
 
@@ -1231,7 +1243,7 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
             )
         with bulk_ignore_col:
             st.button(
-                "� Ignore",
+                "🔕 Ignore",
                 use_container_width=True,
                 key="bulk_ignore",
                 on_click=_apply_bulk_action,
@@ -1254,10 +1266,16 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
 ACTION_PLACEHOLDER = "Review / Fix"
 ACTION_AI_SUGGEST = "🤖 AI Suggest"
 ACTION_REMEDIATE = "✅ Remediate"
-ACTION_IGNORE = "� Ignore"
+ACTION_IGNORE = "🔕 Ignore"
 ACTION_REMOVE = "🗑️ Remove"
 ROW_ACTION_OPTIONS = [ACTION_PLACEHOLDER, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
 ROW_ACTION_OPTIONS_RULE3 = [ACTION_PLACEHOLDER, ACTION_AI_SUGGEST, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
+# Rule 1 (below the minimum reportable loan value) has no "correct number"
+# to fix and no AI agent operating on it - the brief's own remediation
+# guidance for this rule is "remove from the report", full stop. So a
+# Rule-1-failing row only offers Remove or Ignore (override), never
+# Remediate/AI Suggest, which imply there's something to fix per-row.
+ROW_ACTION_OPTIONS_RULE1 = [ACTION_PLACEHOLDER, ACTION_REMOVE, ACTION_IGNORE]
 ROW_ACTION_TO_REVIEW_STATE = {
     ACTION_REMEDIATE: "Remediated (AI/Manual)",
     ACTION_IGNORE: "Ignored",
@@ -1265,7 +1283,9 @@ ROW_ACTION_TO_REVIEW_STATE = {
 }
 
 
-def _fetch_ai_suggestion_now(loan_id: str, company: str, loan_value: float, current_asset: str) -> None:
+def _fetch_ai_suggestion_now(
+    loan_id: str, company: str, loan_value: float, current_asset: str, current_asset_value: float = 0.0
+) -> None:
     """
     Call the suggestion API for a single loan, on-demand (real-time, ~2-5s),
     instead of the old approach of pre-computing suggestions for every Rule 3
@@ -1275,7 +1295,12 @@ def _fetch_ai_suggestion_now(loan_id: str, company: str, loan_value: float, curr
     try:
         resp = requests.post(
             SUGGESTION_API_URL,
-            json={"company_name": company, "loan_value": loan_value, "current_asset": current_asset},
+            json={
+                "company_name": company,
+                "loan_value": loan_value,
+                "current_asset": current_asset,
+                "current_asset_value": current_asset_value,
+            },
             timeout=30,
         )
         resp.raise_for_status()
@@ -1290,6 +1315,7 @@ def _on_row_action_change(
     company: str = "",
     loan_value: float = 0.0,
     current_asset: str = "",
+    current_asset_value: float = 0.0,
 ) -> None:
     """
     Apply the action chosen in one row's Actions dropdown, then reset that
@@ -1310,7 +1336,7 @@ def _on_row_action_change(
     """
     chosen_action = st.session_state[select_key]
     if chosen_action == ACTION_AI_SUGGEST:
-        _fetch_ai_suggestion_now(loan_id, company, loan_value, current_asset)
+        _fetch_ai_suggestion_now(loan_id, company, loan_value, current_asset, current_asset_value)
     else:
         new_review_state = ROW_ACTION_TO_REVIEW_STATE.get(chosen_action)
         if new_review_state is not None:
@@ -1355,16 +1381,26 @@ def _render_workdesk_row(row: pd.Series) -> None:
         # nothing for the AI asset-suggestion agent to recommend here - the
         # expected currency is a deterministic lookup already computed by the
         # Go pipeline, so we can just show it directly (no API call needed).
-        rule2_hint_html = ""
-        expected_currency = row.get("expected_currency")
-        if not row["rule2_pass"] and expected_currency:
-            rule2_hint_html = (
-                f'<div class="row-ai-suggestion">💱 Fix: use {expected_currency} instead of {row["currency"]}</div>'
+        #
+        # Rule 1 takes priority over the Rule 2 hint: a loan below the minimum
+        # reportable value is out of scope entirely, so fixing its currency
+        # wouldn't change its disposition - there's nothing to correct, only
+        # to remove (see ROW_ACTION_OPTIONS_RULE1 below).
+        value_hint_html = ""
+        if not row["rule1_pass"]:
+            value_hint_html = (
+                '<div class="row-ai-suggestion">🚫 Below minimum reportable value — out of scope, recommended: Remove</div>'
             )
+        else:
+            expected_currency = row.get("expected_currency")
+            if not row["rule2_pass"] and expected_currency:
+                value_hint_html = (
+                    f'<div class="row-ai-suggestion">💱 Fix: use {expected_currency} instead of {row["currency"]}</div>'
+                )
         st.markdown(
             f'<div class="row-primary">{fmt_number(row["loan_value"], native_decimals)} {row["currency"]}</div>'
             f'<div class="row-secondary">~{fmt_number(row["loan_value_eur"], 2)} EUR</div>'
-            f"{rule2_hint_html}",
+            f"{value_hint_html}",
             unsafe_allow_html=True,
         )
 
@@ -1385,7 +1421,9 @@ def _render_workdesk_row(row: pd.Series) -> None:
                 reason = str(on_demand_suggestion.get("reason", "No suitable alternative found."))
                 short_reason = reason if len(reason) <= 90 else reason[:88] + "…"
                 ai_hint_html = f'<div class="row-ai-suggestion">💡 AI: {short_reason}</div>'
-        elif not row["rule3_pass"] and row.get("ai_suggested_asset"):
+        elif row["rule1_pass"] and not row["rule3_pass"] and row.get("ai_suggested_asset"):
+            # No point suggesting a substitute asset for a loan that's out of
+            # scope anyway due to a Rule 1 failure (see the value-cell hint above).
             ai_hint_html = f'<div class="row-ai-suggestion">💡 AI suggests: {row.get("ai_suggested_asset")}</div>'
         st.markdown(
             f'<div class="row-asset" title="{asset_label}">{short_label}</div>'
@@ -1402,10 +1440,17 @@ def _render_workdesk_row(row: pd.Series) -> None:
 
     # -- R1 / R2 / R3 pass-fail badges --------------------------------------------------
     with row_cols[7]:
+        # If Rule 1 already fails, this loan is out of scope for reporting
+        # regardless of R2/R3 (see brief: "the suggested fix is not a
+        # corrected number - there is nothing to correct"). R2/R3 are still
+        # computed/counted for the portfolio-wide per-rule report, but their
+        # badges are greyed out here to show they weren't actually evaluated
+        # for THIS loan's remediation - it's being removed either way.
+        rule1_failed = not row["rule1_pass"]
         st.markdown(
             rule_badge_html("R1", row["rule1_pass"])
-            + rule_badge_html("R2", row["rule2_pass"])
-            + rule_badge_html("R3", row["rule3_pass"]),
+            + rule_badge_html("R2", row["rule2_pass"], muted=rule1_failed)
+            + rule_badge_html("R3", row["rule3_pass"], muted=rule1_failed),
             unsafe_allow_html=True,
         )
 
@@ -1415,14 +1460,26 @@ def _render_workdesk_row(row: pd.Series) -> None:
             st.markdown('<span class="row-secondary">— No action needed —</span>', unsafe_allow_html=True)
         else:
             select_key = f"action_{loan_id}"
-            row_options = ROW_ACTION_OPTIONS if row["rule3_pass"] else ROW_ACTION_OPTIONS_RULE3
+            if not row["rule1_pass"]:
+                row_options = ROW_ACTION_OPTIONS_RULE1
+            elif not row["rule3_pass"]:
+                row_options = ROW_ACTION_OPTIONS_RULE3
+            else:
+                row_options = ROW_ACTION_OPTIONS
             st.selectbox(
                 "Action",
                 row_options,
                 key=select_key,
                 label_visibility="collapsed",
                 on_change=_on_row_action_change,
-                args=(loan_id, select_key, row["company"], row["loan_value"], row["asset_type"]),
+                args=(
+                    loan_id,
+                    select_key,
+                    row["company"],
+                    row["loan_value"],
+                    row["asset_type"],
+                    row["asset_value"],
+                ),
             )
 
     st.markdown('<div class="lcs-divider"></div>', unsafe_allow_html=True)

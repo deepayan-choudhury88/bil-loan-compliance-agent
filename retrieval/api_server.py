@@ -58,6 +58,11 @@ class SuggestionHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "loan_value_must_be_number"})
             return
 
+        try:
+            current_asset_value = float(req.get("current_asset_value", 0.0))
+        except Exception:
+            current_asset_value = 0.0
+
         if not company_name or not current_asset:
             self._send_json(400, {"error": "company_name_and_current_asset_required"})
             return
@@ -67,6 +72,7 @@ class SuggestionHandler(BaseHTTPRequestHandler):
                 company_name=company_name,
                 loan_value=loan_value,
                 current_asset=current_asset,
+                current_asset_value=current_asset_value,
             )
             self._send_json(200, result)
         except Exception as exc:

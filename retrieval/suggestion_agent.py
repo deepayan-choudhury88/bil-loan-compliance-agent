@@ -34,7 +34,9 @@ class AssetCandidate:
 
 def _build_explanation_prompt(
     company_name: str,
+    loan_value: float,
     current_asset: str,
+    current_asset_value: float,
     threshold: float,
     all_assets: List[AssetCandidate],
     suggested_asset: Optional[AssetCandidate],
@@ -58,16 +60,24 @@ def _build_explanation_prompt(
         if suggested_asset
         else "null"
     )
+    shortfall = max(threshold - current_asset_value, 0.0)
 
     return f"""
 You are a compliance reviewer assistant.
 
 Write a short, factual explanation for this deterministic collateral decision.
-Do not invent any numbers or assets.
+Do not invent any numbers or assets. State: the loan value, the required
+collateral threshold (50% of the loan value), why the current asset falls
+short (its value and the shortfall amount), and - if one was found - the
+recommended alternative asset and its value, or that no alternative was
+found.
 
 - company_name: {company_name}
+- loan_value: {loan_value:.6f}
 - current_asset: {current_asset}
+- current_asset_value: {current_asset_value:.6f}
 - required_threshold: {threshold:.6f}
+- shortfall: {shortfall:.6f}
 - parsed_assets: {assets_json}
 - selected_asset: {selected_json}
 
@@ -259,27 +269,41 @@ def _choose_best_asset(
 
 
 def _default_reason(
+    company_name: str,
+    loan_value: float,
+    current_asset: str,
+    current_asset_value: float,
     suggested_asset: Optional[AssetCandidate],
     threshold: float,
     all_assets: List[AssetCandidate],
 ) -> str:
     """Deterministic fallback reason used when LLM explanation is unavailable."""
+    shortfall = max(threshold - current_asset_value, 0.0)
+    shortfall_clause = (
+        f"This loan is worth {loan_value:,.2f}, which requires at least {threshold:,.2f} "
+        f"(50%) in pledged collateral. The current asset, {current_asset} "
+        f"({current_asset_value:,.2f}), falls short by {shortfall:,.2f}."
+    )
+
     if suggested_asset is None:
         if not all_assets:
-            return "No suitable collateral available. No parseable assets found in retrieved context."
+            return f"{shortfall_clause} No parseable assets were found in {company_name}'s records, so no alternative can be suggested."
         return (
-            "No suitable collateral available. "
-            f"No parsed asset meets the required threshold of {threshold:.2f}."
+            f"{shortfall_clause} No asset in {company_name}'s records meets the required "
+            f"threshold of {threshold:,.2f}, so no substitution can be suggested."
         )
     return (
-        f"Selected {suggested_asset.name} because its value ({suggested_asset.value:.2f}) "
-        f"meets the required threshold ({threshold:.2f})."
+        f"{shortfall_clause} {company_name}'s records show {suggested_asset.name} "
+        f"({suggested_asset.value:,.2f}) meets the requirement, so it is recommended as a "
+        "replacement."
     )
 
 
 def _generate_reason_with_llm(
     company_name: str,
+    loan_value: float,
     current_asset: str,
+    current_asset_value: float,
     threshold: float,
     all_assets: List[AssetCandidate],
     suggested_asset: Optional[AssetCandidate],
@@ -289,7 +313,9 @@ def _generate_reason_with_llm(
         llm = create_chat_llm(default_model=DEFAULT_LLM_MODEL, temperature=0)
         prompt = _build_explanation_prompt(
             company_name=company_name,
+            loan_value=loan_value,
             current_asset=current_asset,
+            current_asset_value=current_asset_value,
             threshold=threshold,
             all_assets=all_assets,
             suggested_asset=suggested_asset,
@@ -302,13 +328,22 @@ def _generate_reason_with_llm(
     except Exception:
         pass
 
-    return _default_reason(suggested_asset, threshold, all_assets)
+    return _default_reason(
+        company_name=company_name,
+        loan_value=loan_value,
+        current_asset=current_asset,
+        current_asset_value=current_asset_value,
+        suggested_asset=suggested_asset,
+        threshold=threshold,
+        all_assets=all_assets,
+    )
 
 
 def suggest_asset(
     company_name: str,
     loan_value: float,
     current_asset: str,
+    current_asset_value: float = 0.0,
     retrieved_context: str | None = None,
 ) -> Dict[str, Any]:
     """Suggest an alternative asset using deterministic selection rules in Python."""
@@ -319,7 +354,9 @@ def suggest_asset(
     best_asset = _choose_best_asset(all_assets, threshold, current_asset)
     reason = _generate_reason_with_llm(
         company_name=company_name,
+        loan_value=float(loan_value),
         current_asset=current_asset,
+        current_asset_value=float(current_asset_value),
         threshold=threshold,
         all_assets=all_assets,
         suggested_asset=best_asset,

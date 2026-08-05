@@ -73,6 +73,11 @@ def main() -> None:
         except ValueError:
             loan_value = 0.0
 
+        try:
+            current_asset_value = float(loan.get("asset_value", "0"))
+        except ValueError:
+            current_asset_value = 0.0
+
         # Retrieve context once and reuse it for suggestion generation.
         context = get_company_context(company_name)
 
@@ -80,6 +85,7 @@ def main() -> None:
             company_name=company_name,
             loan_value=loan_value,
             current_asset=current_asset,
+            current_asset_value=current_asset_value,
             retrieved_context=context,
         )
         print(format_report(loan, suggestion))
