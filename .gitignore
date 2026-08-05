@@ -2,3 +2,8 @@
 .env
 .env.*
 !.env.example
+pipeline/pipeline
+data/compliance_report.json
+__pycache__/
+.venv/
+venv/
