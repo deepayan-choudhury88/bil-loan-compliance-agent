@@ -47,6 +47,19 @@ type OPAResponse struct {
 	} `json:"result"`
 }
 
+type SuggestionRequest struct {
+	CompanyName  string  `json:"company_name"`
+	LoanValue    float64 `json:"loan_value"`
+	CurrentAsset string  `json:"current_asset"`
+}
+
+type SuggestionResponse struct {
+	Status         string  `json:"status"`
+	SuggestedAsset string  `json:"suggested_asset,omitempty"`
+	AssetValue     float64 `json:"asset_value,omitempty"`
+	Reason         string  `json:"reason"`
+}
+
 type ReportData struct {
 	TotalLoansChecked int
 	TotalFailures     int
@@ -76,6 +89,50 @@ func fetchRates() (map[string]float64, error) {
 		return nil, err
 	}
 	return data.Rates, nil
+}
+
+func hasRule3Violation(violations []string) bool {
+	for _, violation := range violations {
+		if strings.Contains(violation, "Rule 3 Failed") {
+			return true
+		}
+	}
+	return false
+}
+
+func callSuggestionAPI(client *http.Client, loan LoanInput) (*SuggestionResponse, error) {
+	apiURL := os.Getenv("SUGGESTION_API_URL")
+	if apiURL == "" {
+		apiURL = "http://127.0.0.1:8000/suggest"
+	}
+
+	reqBody := SuggestionRequest{
+		CompanyName:  loan.CompanyName,
+		LoanValue:    loan.LoanValue,
+		CurrentAsset: loan.AssetDescription,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("suggestion API status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var out SuggestionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func main() {
@@ -186,6 +243,12 @@ func main() {
 			}
 			resp.Body.Close()
 
+			var suggestion *SuggestionResponse
+			var suggestionErr error
+			if !opaResult.Result.Allow && hasRule3Violation(opaResult.Result.Violations) {
+				suggestion, suggestionErr = callSuggestionAPI(client, loanInput)
+			}
+
 			// MUTEX LOCK: Safely update the shared report variables
 			mu.Lock()
 			report.Portfolio[cName] += lValEUR
@@ -206,6 +269,20 @@ func main() {
 				}
 
 				details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", lVal, cur, aVal, cur, hq)
+				if suggestionErr != nil {
+					details += fmt.Sprintf(" | Suggestion Error: %v", suggestionErr)
+				} else if suggestion != nil {
+					if suggestion.Status == "success" {
+						details += fmt.Sprintf(
+							" | Suggested Asset: %s (%.2f) | Suggestion Reason: %s",
+							suggestion.SuggestedAsset,
+							suggestion.AssetValue,
+							suggestion.Reason,
+						)
+					} else {
+						details += fmt.Sprintf(" | Suggested Asset: N/A | Suggestion Reason: %s", suggestion.Reason)
+					}
+				}
 
 				report.FailedLoans = append(report.FailedLoans, FailedLoan{
 					LoanID:      lID,
