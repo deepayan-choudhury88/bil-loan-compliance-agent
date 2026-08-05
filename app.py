@@ -41,8 +41,7 @@ file.
 
 HOW TO RUN IT
 --------------
-See the separate step-by-step guide document for a non-developer walk-
-through. In short:
+See README.md for a full, non-developer-friendly walkthrough. In short:
     pip install -r requirements.txt
     streamlit run app.py
 """
@@ -55,8 +54,11 @@ from __future__ import annotations
 # STANDARD LIBRARY IMPORTS
 # -----------------------------------------------------------------------------
 import io
+import json
+import os
 import random
 from datetime import datetime
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # THIRD-PARTY IMPORTS
@@ -64,7 +66,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
+
+SUGGESTION_API_URL = os.environ.get("SUGGESTION_API_URL", "http://127.0.0.1:8000/suggest")
 
 # =============================================================================
 # 1. PAGE CONFIG
@@ -97,12 +102,21 @@ st.set_page_config(
 #                free text using an LLM.
 #
 # >>> REPLACE ME <<< change this value when you are ready to use real data.
-DATA_SOURCE_MODE = "demo"  # one of: "demo", "csv", "custom"
+DATA_SOURCE_MODE = "custom"  # one of: "demo", "csv", "custom"
 
 # >>> REPLACE ME <<< only used when DATA_SOURCE_MODE == "csv".
 # Point this at a CSV file that has the columns listed in EXPORT_COLUMNS
 # further down this file.
 CSV_DATA_PATH = "data/my_loan_portfolio.csv"
+
+# Used when DATA_SOURCE_MODE == "custom": the JSON report written by
+# pipeline/main.go (the Go compliance pipeline) after it runs every loan
+# through OPA + the collateral-suggestion API. Run, in order:
+#   1. OPA server (see README.md "Step 1")
+#   2. python3 -m retrieval.api_server   (collateral suggestion API, :8000)
+#   3. cd pipeline && go run main.go     (writes this JSON file)
+# then `streamlit run app.py`.
+CUSTOM_REPORT_PATH = "data/compliance_report.json"
 
 # =============================================================================
 # 3. DOMAIN CONSTANTS
@@ -396,6 +410,7 @@ def inject_css() -> None:
         .row-primary   {{ color: {c['text_primary']}; font-size: 13.5px; font-weight: 700; }}
         .row-secondary {{ color: {c['text_secondary']}; font-size: 11.5px; }}
         .row-asset     {{ color: {c['text_primary']}; font-size: 13px; }}
+        .row-ai-suggestion {{ color: {c['indigo']}; font-size: 11.5px; font-weight: 600; margin-top: 2px; }}
 
         .lcs-col-header {{
             color: {c['text_secondary']}; font-size: 11px; font-weight: 800; letter-spacing: 0.04em;
@@ -754,28 +769,44 @@ def load_data_from_custom_source() -> pd.DataFrame:
     """
     OPTION D: Your single entry point for "real" data once it's ready.
 
-    >>> REPLACE ME <<<
-    This is the function called when DATA_SOURCE_MODE = "custom" (see the
-    switch near the top of this file). Point it at whichever adapter (or
-    combination of adapters) makes sense for your pipeline - CSV, PDF +
-    vector store, LLM extraction, a live database/API call, or several of
-    these combined. A simple example:
+    This reads the JSON report written by the Go pipeline (pipeline/main.go)
+    after it runs every loan in data/loans.csv through:
+        1. Live FX conversion to EUR
+        2. The OPA/Rego compliance policy (policy/compliance.rego) for the
+           three deterministic rules
+        3. The collateral-suggestion API (retrieval/api_server.py, backed by
+           the RAG suggestion agent) for any loan that fails Rule 3
 
-        def load_data_from_custom_source() -> pd.DataFrame:
-            csv_part = load_data_from_csv("data/system_export.csv")
-            pdf_part = load_data_from_pdf_vectors("data/loan_pdfs/")
-            return pd.concat([csv_part, pdf_part], ignore_index=True)
+    See CUSTOM_REPORT_PATH near the top of this file for the exact run
+    order that produces this file.
 
     Returns
     -------
     pandas.DataFrame
+        One row per loan, matching EXPORT_COLUMNS (plus a few extra
+        `ai_*` columns carrying the AI-suggested replacement collateral,
+        when one was found).
     """
-    raise NotImplementedError(
-        "load_data_from_custom_source() is a placeholder. Call your own "
-        "adapter(s) here (load_data_from_csv / load_data_from_pdf_vectors / "
-        "load_data_from_llm_extraction, or your own database/API call) and "
-        "return a single combined DataFrame."
-    )
+    report_path = Path(CUSTOM_REPORT_PATH)
+    if not report_path.exists():
+        raise FileNotFoundError(
+            f"'{report_path}' not found. Run the Go pipeline first so it can "
+            "write this report: start OPA, run "
+            "`python3 -m retrieval.api_server`, then `cd pipeline && go run "
+            "main.go`. See README.md for the full sequence."
+        )
+
+    with report_path.open(encoding="utf-8") as f:
+        records = json.load(f)
+
+    df = pd.DataFrame(records)
+    missing_columns = [col for col in EXPORT_COLUMNS if col not in df.columns]
+    if missing_columns:
+        raise ValueError(
+            f"'{report_path}' is missing required column(s): {missing_columns}. "
+            f"See the EXPORT_COLUMNS schema at the top of app.py."
+        )
+    return df
 
 
 def apply_remediation_overrides(df: pd.DataFrame) -> pd.DataFrame:
@@ -854,6 +885,7 @@ def init_session_state() -> None:
         "selected_ids": set(),  # loan_ids checked in the Review Workdesk
         "page": 1,  # current page in the Review Workdesk table
         "last_active_section": NAV_REVIEW_WORKDESK,  # sticky nav selection - see main()
+        "ai_suggestions": {},  # {loan_id: suggestion API response}, fetched on-demand
     }
     for key, default_value in defaults.items():
         if key not in st.session_state:
@@ -876,7 +908,11 @@ def get_portfolio_data() -> pd.DataFrame:
     elif DATA_SOURCE_MODE == "csv":
         base_df = load_data_from_csv(CSV_DATA_PATH)
     elif DATA_SOURCE_MODE == "custom":
-        base_df = load_data_from_custom_source()
+        try:
+            base_df = load_data_from_custom_source()
+        except FileNotFoundError as exc:
+            st.warning(f"{exc}\n\nShowing synthetic demo data in the meantime.")
+            base_df = generate_demo_loans(100_000, st.session_state.seed)
     else:  # DATA_SOURCE_MODE == "demo" (default)
         base_df = generate_demo_loans(100_000, st.session_state.seed)
     return apply_remediation_overrides(base_df)
@@ -1216,10 +1252,12 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
 # entry is a placeholder/prompt, not a real state - the dropdown always
 # snaps back to it after applying a choice (see _on_row_action_change).
 ACTION_PLACEHOLDER = "Review / Fix"
+ACTION_AI_SUGGEST = "🤖 AI Suggest"
 ACTION_REMEDIATE = "✅ Remediate"
 ACTION_IGNORE = "🙈 Ignore"
 ACTION_REMOVE = "🗑️ Remove"
 ROW_ACTION_OPTIONS = [ACTION_PLACEHOLDER, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
+ROW_ACTION_OPTIONS_RULE3 = [ACTION_PLACEHOLDER, ACTION_AI_SUGGEST, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
 ROW_ACTION_TO_REVIEW_STATE = {
     ACTION_REMEDIATE: "Remediated (AI/Manual)",
     ACTION_IGNORE: "Ignored",
@@ -1227,7 +1265,32 @@ ROW_ACTION_TO_REVIEW_STATE = {
 }
 
 
-def _on_row_action_change(loan_id: str, select_key: str) -> None:
+def _fetch_ai_suggestion_now(loan_id: str, company: str, loan_value: float, current_asset: str) -> None:
+    """
+    Call the suggestion API for a single loan, on-demand (real-time, ~2-5s),
+    instead of the old approach of pre-computing suggestions for every Rule 3
+    failure in bulk (thousands of real LLM calls - far too slow for a live
+    demo). Result is cached in session_state so it survives reruns.
+    """
+    try:
+        resp = requests.post(
+            SUGGESTION_API_URL,
+            json={"company_name": company, "loan_value": loan_value, "current_asset": current_asset},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        st.session_state.ai_suggestions[loan_id] = resp.json()
+    except Exception as exc:
+        st.session_state.ai_suggestions[loan_id] = {"status": "error", "reason": f"Suggestion API unavailable: {exc}"}
+
+
+def _on_row_action_change(
+    loan_id: str,
+    select_key: str,
+    company: str = "",
+    loan_value: float = 0.0,
+    current_asset: str = "",
+) -> None:
     """
     Apply the action chosen in one row's Actions dropdown, then reset that
     dropdown back to its placeholder.
@@ -1246,9 +1309,12 @@ def _on_row_action_change(loan_id: str, select_key: str) -> None:
     row this dropdown was never opened for).
     """
     chosen_action = st.session_state[select_key]
-    new_review_state = ROW_ACTION_TO_REVIEW_STATE.get(chosen_action)
-    if new_review_state is not None:
-        set_loan_review_state(loan_id, new_review_state)
+    if chosen_action == ACTION_AI_SUGGEST:
+        _fetch_ai_suggestion_now(loan_id, company, loan_value, current_asset)
+    else:
+        new_review_state = ROW_ACTION_TO_REVIEW_STATE.get(chosen_action)
+        if new_review_state is not None:
+            set_loan_review_state(loan_id, new_review_state)
     st.session_state[select_key] = ACTION_PLACEHOLDER
 
 
@@ -1285,9 +1351,20 @@ def _render_workdesk_row(row: pd.Series) -> None:
     # -- loan value (native currency + EUR-converted) -------------------------------
     with row_cols[4]:
         native_decimals = 0 if row["currency"] == "JPY" else 2
+        # Rule 2 is a currency mismatch, not a collateral shortfall, so there's
+        # nothing for the AI asset-suggestion agent to recommend here - the
+        # expected currency is a deterministic lookup already computed by the
+        # Go pipeline, so we can just show it directly (no API call needed).
+        rule2_hint_html = ""
+        expected_currency = row.get("expected_currency")
+        if not row["rule2_pass"] and expected_currency:
+            rule2_hint_html = (
+                f'<div class="row-ai-suggestion">💱 Fix: use {expected_currency} instead of {row["currency"]}</div>'
+            )
         st.markdown(
             f'<div class="row-primary">{fmt_number(row["loan_value"], native_decimals)} {row["currency"]}</div>'
-            f'<div class="row-secondary">~{fmt_number(row["loan_value_eur"], 2)} EUR</div>',
+            f'<div class="row-secondary">~{fmt_number(row["loan_value_eur"], 2)} EUR</div>'
+            f"{rule2_hint_html}",
             unsafe_allow_html=True,
         )
 
@@ -1296,9 +1373,24 @@ def _render_workdesk_row(row: pd.Series) -> None:
         asset_label = row["asset_type"]
         short_label = asset_label if len(asset_label) <= 42 else asset_label[:40] + "…"
         native_decimals = 0 if row["currency"] == "JPY" else 2
+        ai_hint_html = ""
+        on_demand_suggestion = st.session_state.ai_suggestions.get(loan_id)
+        if on_demand_suggestion is not None:
+            if on_demand_suggestion.get("status") == "success":
+                ai_hint_html = (
+                    f'<div class="row-ai-suggestion">💡 AI suggests: '
+                    f'{on_demand_suggestion.get("suggested_asset")}</div>'
+                )
+            else:
+                reason = str(on_demand_suggestion.get("reason", "No suitable alternative found."))
+                short_reason = reason if len(reason) <= 90 else reason[:88] + "…"
+                ai_hint_html = f'<div class="row-ai-suggestion">💡 AI: {short_reason}</div>'
+        elif not row["rule3_pass"] and row.get("ai_suggested_asset"):
+            ai_hint_html = f'<div class="row-ai-suggestion">💡 AI suggests: {row.get("ai_suggested_asset")}</div>'
         st.markdown(
             f'<div class="row-asset" title="{asset_label}">{short_label}</div>'
-            f'<div class="row-secondary">{fmt_number(row["asset_value"], native_decimals)} {row["currency"]}</div>',
+            f'<div class="row-secondary">{fmt_number(row["asset_value"], native_decimals)} {row["currency"]}</div>'
+            f"{ai_hint_html}",
             unsafe_allow_html=True,
         )
 
@@ -1323,13 +1415,14 @@ def _render_workdesk_row(row: pd.Series) -> None:
             st.markdown('<span class="row-secondary">— No action needed —</span>', unsafe_allow_html=True)
         else:
             select_key = f"action_{loan_id}"
+            row_options = ROW_ACTION_OPTIONS if row["rule3_pass"] else ROW_ACTION_OPTIONS_RULE3
             st.selectbox(
                 "Action",
-                ROW_ACTION_OPTIONS,
+                row_options,
                 key=select_key,
                 label_visibility="collapsed",
                 on_change=_on_row_action_change,
-                args=(loan_id, select_key),
+                args=(loan_id, select_key, row["company"], row["loan_value"], row["asset_type"]),
             )
 
     st.markdown('<div class="lcs-divider"></div>', unsafe_allow_html=True)
