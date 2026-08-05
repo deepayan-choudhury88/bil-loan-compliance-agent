@@ -48,9 +48,10 @@ type OPAResponse struct {
 }
 
 type SuggestionRequest struct {
-	CompanyName  string  `json:"company_name"`
-	LoanValue    float64 `json:"loan_value"`
-	CurrentAsset string  `json:"current_asset"`
+	CompanyName       string  `json:"company_name"`
+	LoanValue         float64 `json:"loan_value"`
+	CurrentAsset      string  `json:"current_asset"`
+	CurrentAssetValue float64 `json:"current_asset_value"`
 }
 
 type SuggestionResponse struct {
@@ -145,9 +146,10 @@ func callSuggestionAPI(client *http.Client, loan LoanInput) (*SuggestionResponse
 	}
 
 	reqBody := SuggestionRequest{
-		CompanyName:  loan.CompanyName,
-		LoanValue:    loan.LoanValue,
-		CurrentAsset: loan.AssetDescription,
+		CompanyName:       loan.CompanyName,
+		LoanValue:         loan.LoanValue,
+		CurrentAsset:      loan.AssetDescription,
+		CurrentAssetValue: loan.AssetValue,
 	}
 
 	payload, err := json.Marshal(reqBody)
