@@ -57,7 +57,6 @@ import html
 import io
 import json
 import os
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -162,6 +161,29 @@ MIN_VALUE_PERCENTILE_DEMO = 10  # Rule 1, demo data only:
 # Replace with a fixed EUR
 # amount (e.g. MIN_LOAN_VALUE_EUR
 # = 50_000) once you have real data.
+
+# Human-readable descriptions of the three rules exactly as enforced by
+# policy/compliance.rego (the actual OPA policy the Go pipeline evaluates
+# against, in "custom" mode). Shown in the UI's "View Compliance Rules"
+# popover and as tooltips on the R1/R2/R3 badges, so reviewers don't have
+# to go dig through the .rego file to know what each rule actually checks.
+RULE_DEFINITIONS = {
+    "R1": {
+        "title": "Rule 1 \u2014 Minimum Loan Value",
+        "description": "The loan's EUR-converted value must exceed 25,000 EUR.",
+        "on_fail": "The loan is out of scope entirely \u2014 recommended action is to remove it. Rules 2 and 3 are not evaluated for remediation purposes.",
+    },
+    "R2": {
+        "title": "Rule 2 \u2014 Currency Match",
+        "description": "The loan's settlement currency must match the currency expected for the borrower's HQ country.",
+        "on_fail": "Recommended action is to correct the loan's currency to the expected one.",
+    },
+    "R3": {
+        "title": "Rule 3 \u2014 Asset Coverage",
+        "description": "The pledged collateral's value must be at least 50% of the loan value.",
+        "on_fail": "The AI suggestion agent recommends an alternative asset from the company's records, if one meets the threshold.",
+    },
+}
 
 # The five possible "review states" a loan can be in once a human/agent has
 # looked at a compliance failure. "Clean / Passed" is reserved for loans
@@ -515,8 +537,7 @@ def generate_demo_loans(n: int, seed: int) -> pd.DataFrame:
     n : int
         Number of loans to generate (the app calls this with n=100_000).
     seed : int
-        Random seed. Changing the seed (e.g. via the "Reset 100k" button)
-        produces a fresh random portfolio.
+        Random seed. Changing the seed produces a fresh random portfolio.
 
     Returns
     -------
@@ -912,13 +933,18 @@ def status_pill_html(review_state: str) -> str:
     return f'<span class="pill {css_class}">{label}</span>'
 
 
-def rule_badge_html(label: str, passed: bool, muted: bool = False) -> str:
+def rule_badge_html(label: str, passed: bool, muted: bool = False, tooltip: str = "") -> str:
     """Return a small coloured HTML badge (e.g. 'R1') showing pass/fail.
 
     When `muted` is True (Rule 1 already failed, so this loan is out of
     scope regardless of R2/R3), the badge is greyed out with a tooltip
     instead of showing red/green - its outcome no longer affects the
     loan's disposition.
+
+    `tooltip`, when given, is shown on hover via the HTML `title`
+    attribute (e.g. the rule's plain-English definition from
+    RULE_DEFINITIONS) - ignored when `muted` is True since that already
+    has its own explanatory tooltip.
     """
     if muted:
         return (
@@ -926,7 +952,8 @@ def rule_badge_html(label: str, passed: bool, muted: bool = False) -> str:
             f'title="Not applicable for remediation - loan already out of scope due to Rule 1">{label}</span>'
         )
     css_class = "rule-pass" if passed else "rule-fail"
-    return f'<span class="rule-badge {css_class}">{label}</span>'
+    title_attr = f' title="{html.escape(tooltip)}"' if tooltip else ""
+    return f'<span class="rule-badge {css_class}"{title_attr}>{label}</span>'
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -989,17 +1016,6 @@ def get_portfolio_data() -> pd.DataFrame:
         base_df = generate_demo_loans(100_000, st.session_state.seed)
         st.session_state.report_meta = None
     return apply_remediation_overrides(base_df)
-
-
-def reset_demo_data() -> None:
-    """Regenerate a brand-new random demo portfolio (the 'Reset 100k' button)."""
-    st.session_state.seed = random.randint(1, 10_000_000)
-    st.session_state.report_meta = None
-    st.session_state.loan_overrides = {}
-    st.session_state.custom_df = None
-    st.session_state.selected_ids = set()
-    st.session_state.page = 1
-    generate_demo_loans.clear()  # drop the cached DataFrame for the old seed
 
 
 def render_report_freshness_banner() -> None:
@@ -1120,17 +1136,17 @@ def render_header(df: pd.DataFrame) -> None:
         )
 
         # -- action buttons ---------------------------------------------------
-        # Import CSV / Reset 100k / Export Audit CSV sit directly in the same
-        # outer container as everything else above (no nested sub-container).
-        # A nested st.container() defaults its own width to "stretch" - 100%
-        # of its parent - so wrapping these three in their own inner container
+        # Import CSV / Export Audit CSV sit directly in the same outer
+        # container as everything else above (no nested sub-container). A
+        # nested st.container() defaults its own width to "stretch" - 100%
+        # of its parent - so wrapping these in their own inner container
         # made THAT container claim a full line for itself and permanently
         # push the buttons onto row 2, no matter how much room was free.
         # Buttons/popovers default to a content-sized width instead, so left
         # as direct children here they simply sit inline and wrap onto a new
         # line only when the row actually runs out of space.
         #
-        # None of the three use use_container_width=True any more: that
+        # Neither of the two use use_container_width=True any more: that
         # stretched each button to fill its (shrinking) st.columns() slot,
         # which is what forced their labels to wrap letter-by-letter. Left
         # at their natural content width, they simply wrap as a whole group
@@ -1157,9 +1173,13 @@ def render_header(df: pd.DataFrame) -> None:
                 except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
                     st.error(f"Could not read CSV: {exc}")
 
-        if st.button("🔄 Reset 100k", key="reset_btn"):
-            reset_demo_data()
-            st.rerun()
+        with st.popover("📜 Compliance Rules"):
+            st.caption("The three deterministic rules every loan is checked against (policy/compliance.rego).")
+            for rule_key in ("R1", "R2", "R3"):
+                rule = RULE_DEFINITIONS[rule_key]
+                st.markdown(f"**{rule['title']}**")
+                st.markdown(rule["description"])
+                st.caption(f"If it fails: {rule['on_fail']}")
 
         st.download_button(
             "⬇️ Export Audit CSV",
@@ -1548,9 +1568,13 @@ def _render_workdesk_row(row: pd.Series) -> None:
         # for THIS loan's remediation - it's being removed either way.
         rule1_failed = not row["rule1_pass"]
         st.markdown(
-            rule_badge_html("R1", row["rule1_pass"])
-            + rule_badge_html("R2", row["rule2_pass"], muted=rule1_failed)
-            + rule_badge_html("R3", row["rule3_pass"], muted=rule1_failed),
+            rule_badge_html("R1", row["rule1_pass"], tooltip=RULE_DEFINITIONS["R1"]["description"])
+            + rule_badge_html(
+                "R2", row["rule2_pass"], muted=rule1_failed, tooltip=RULE_DEFINITIONS["R2"]["description"]
+            )
+            + rule_badge_html(
+                "R3", row["rule3_pass"], muted=rule1_failed, tooltip=RULE_DEFINITIONS["R3"]["description"]
+            ),
             unsafe_allow_html=True,
         )
 
@@ -1921,15 +1945,27 @@ def render_opa_playground(df: pd.DataFrame) -> None:
 
             st.markdown("**Evaluation result:**")
             st.markdown(
-                rule_badge_html("R1 Min Value", bool(loan_row["rule1_pass"]) if rule1_present else True),
+                rule_badge_html(
+                    "R1 Min Value",
+                    bool(loan_row["rule1_pass"]) if rule1_present else True,
+                    tooltip=RULE_DEFINITIONS["R1"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
             st.markdown(
-                rule_badge_html("R2 Currency", bool(loan_row["rule2_pass"]) if rule2_present else True),
+                rule_badge_html(
+                    "R2 Currency",
+                    bool(loan_row["rule2_pass"]) if rule2_present else True,
+                    tooltip=RULE_DEFINITIONS["R2"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
             st.markdown(
-                rule_badge_html("R3 Asset Coverage", bool(loan_row["rule3_pass"]) if rule3_present else True),
+                rule_badge_html(
+                    "R3 Asset Coverage",
+                    bool(loan_row["rule3_pass"]) if rule3_present else True,
+                    tooltip=RULE_DEFINITIONS["R3"]["description"],
+                ),
                 unsafe_allow_html=True,
             )
 
