@@ -1319,6 +1319,7 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
             step=1,
             label_visibility="collapsed",
             key="page_input",
+            width=100,
         )
         st.session_state.page = current_page
 
@@ -1661,7 +1662,7 @@ def _render_report_metric_cards(df: pd.DataFrame) -> tuple:
     pass_rate_pct = passed / total * 100 if total else 0.0
     portfolio_value_eur = df["loan_value_eur"].sum()
 
-    card_cols = st.columns([1, 1, 1, 1, 0.9])
+    card_cols = st.columns(4)
     with card_cols[0]:
         st.markdown(
             f"""<div class="card">
@@ -1697,17 +1698,6 @@ def _render_report_metric_cards(df: pd.DataFrame) -> tuple:
                   <div class="card-sub">Fixed via AI Suggestions or Manual</div>
                 </div>""",
             unsafe_allow_html=True,
-        )
-    with card_cols[4]:
-        st.markdown('<div style="height:6px;"></div>', unsafe_allow_html=True)
-        st.download_button(
-            "📄 Export Full Audit Report CSV",
-            data=dataframe_to_csv_bytes(df),
-            file_name=f"loan_compliance_full_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            type="primary",
-            key="export_report_btn",
         )
 
     return total, passed, unresolved_failures, remediated, ignored, removed
