@@ -11,7 +11,10 @@ portfolio compliance, combining:
 - An **AI collateral-suggestion agent** ([retrieval/](retrieval/)) — a
   LangChain + FAISS RAG pipeline over a company-reference document, backed
   by Azure OpenAI/OpenAI — that suggests an alternative pledged asset when a
-  loan fails the asset-coverage rule.
+  loan fails the asset-coverage rule. This is called **on-demand, one loan
+  at a time, from the Streamlit UI** — never in bulk from the Go pipeline
+  (`ENABLE_AI_SUGGESTIONS=false` by default) — so the deterministic pipeline
+  stays fast even over 100,000 loans.
 - A **Streamlit dashboard** ([app.py](app.py)) tying it all together for
   review: Review Workdesk, Compliance & Portfolio Report, an OPA Rego
   Playground, and an Asset Value Predictor.
