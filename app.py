@@ -119,6 +119,12 @@ CSV_DATA_PATH = "data/my_loan_portfolio.csv"
 # then `streamlit run app.py`.
 CUSTOM_REPORT_PATH = "data/compliance_report.json"
 
+# Sidecar file written next to CUSTOM_REPORT_PATH by the same pipeline run,
+# recording WHEN the report was generated and which FX rate snapshot
+# ("as of" date) was used to convert every loan to EUR. See ReportMeta in
+# pipeline/main.go.
+CUSTOM_REPORT_META_PATH = "data/compliance_report_meta.json"
+
 # =============================================================================
 # 3. DOMAIN CONSTANTS
 #    Business rules, currencies, and vocabulary used to build/evaluate the
@@ -341,6 +347,7 @@ def inject_css() -> None:
         }}
         .lcs-title {{ font-size: 26px; font-weight: 800; color: {c['text_primary']}; margin: 0; line-height: 1.1; }}
         .lcs-subtitle {{ color: {c['text_secondary']}; font-size: 12.5px; margin-top: 2px; }}
+        .lcs-report-meta {{ color: {c['text_secondary']}; font-size: 11.5px; margin: 2px 0 0 2px; }}
         .lcs-pill {{
             display: inline-block; background: {c['indigo_soft']};
             border: 1px solid #cfc7fb; color: #4c3fb8;
@@ -809,7 +816,32 @@ def load_data_from_custom_source() -> pd.DataFrame:
             f"'{report_path}' is missing required column(s): {missing_columns}. "
             f"See the EXPORT_COLUMNS schema at the top of app.py."
         )
+    st.session_state.report_meta = load_report_metadata()
     return df
+
+
+def load_report_metadata() -> dict | None:
+    """
+    Read the small sidecar file the Go pipeline writes next to
+    CUSTOM_REPORT_PATH (see ReportMeta in pipeline/main.go), recording:
+      - generated_at_utc: when this pipeline run finished
+      - fx_rate_date: the "as of" date for the FX rates used to convert
+        every loan to EUR (FX providers only publish rates for market
+        days, so this is often NOT today's date)
+      - total_loans: how many loans were processed
+
+    Returns None if the file doesn't exist (e.g. demo/CSV mode, or the
+    pipeline hasn't been run yet) so callers can hide the timestamp
+    display entirely rather than showing stale or fabricated info.
+    """
+    meta_path = Path(CUSTOM_REPORT_META_PATH)
+    if not meta_path.exists():
+        return None
+    try:
+        with meta_path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def apply_remediation_overrides(df: pd.DataFrame) -> pd.DataFrame:
@@ -901,6 +933,7 @@ def init_session_state() -> None:
         "page": 1,  # current page in the Review Workdesk table
         "last_active_section": NAV_REVIEW_WORKDESK,  # sticky nav selection - see main()
         "ai_suggestions": {},  # {loan_id: suggestion API response}, fetched on-demand
+        "report_meta": None,  # {generated_at_utc, fx_rate_date, total_loans} - see load_report_metadata()
     }
     for key, default_value in defaults.items():
         if key not in st.session_state:
@@ -920,22 +953,27 @@ def get_portfolio_data() -> pd.DataFrame:
     """
     if st.session_state.custom_df is not None:
         base_df = st.session_state.custom_df
+        st.session_state.report_meta = None  # imported CSV has no pipeline-generation metadata
     elif DATA_SOURCE_MODE == "csv":
         base_df = load_data_from_csv(CSV_DATA_PATH)
+        st.session_state.report_meta = None
     elif DATA_SOURCE_MODE == "custom":
         try:
             base_df = load_data_from_custom_source()
         except FileNotFoundError as exc:
             st.warning(f"{exc}\n\nShowing synthetic demo data in the meantime.")
             base_df = generate_demo_loans(100_000, st.session_state.seed)
+            st.session_state.report_meta = None
     else:  # DATA_SOURCE_MODE == "demo" (default)
         base_df = generate_demo_loans(100_000, st.session_state.seed)
+        st.session_state.report_meta = None
     return apply_remediation_overrides(base_df)
 
 
 def reset_demo_data() -> None:
     """Regenerate a brand-new random demo portfolio (the 'Reset 100k' button)."""
     st.session_state.seed = random.randint(1, 10_000_000)
+    st.session_state.report_meta = None
     st.session_state.loan_overrides = {}
     st.session_state.custom_df = None
     st.session_state.selected_ids = set()
@@ -1075,6 +1113,28 @@ def render_header(df: pd.DataFrame) -> None:
             mime="text/csv",
             type="primary",
             key="export_header_btn",
+        )
+
+    # -- report generation / FX rate freshness -----------------------------
+    # Only shown when the portfolio actually came from a live pipeline run
+    # (DATA_SOURCE_MODE == "custom", see load_data_from_custom_source()) -
+    # demo/CSV data has no real generation time or FX snapshot to report,
+    # so report_meta stays None and this is skipped entirely rather than
+    # showing a misleading/fabricated timestamp.
+    report_meta = st.session_state.get("report_meta")
+    if report_meta:
+        generated_display = str(report_meta.get("generated_at_utc", "unknown"))
+        try:
+            generated_dt = datetime.fromisoformat(generated_display.replace("Z", "+00:00"))
+            generated_display = generated_dt.strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            pass
+        fx_date_display = str(report_meta.get("fx_rate_date") or "unknown")
+        st.markdown(
+            f'<div class="lcs-report-meta">📄 Report generated: {html.escape(generated_display)}'
+            f' &nbsp;·&nbsp; 💱 FX rates as of {html.escape(fx_date_display)}'
+            f" (live rates don't always match today - providers only publish for market days)</div>",
+            unsafe_allow_html=True,
         )
 
 
