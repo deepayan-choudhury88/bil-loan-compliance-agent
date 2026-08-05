@@ -1,0 +1,31 @@
+# Streamlit theme configuration.
+#
+# Without this file, Streamlit's native widgets (checkboxes, radio buttons,
+# sliders, the segmented-control nav, focus rings, etc.) fall back to
+# Streamlit's own default accent colour, which is red (#FF4B4B). That
+# clashed with this app's indigo colour scheme - e.g. selected/checked
+# checkboxes rendered with a red border even though every custom-styled
+# element elsewhere in the app is indigo. Setting theme.primaryColor here
+# makes Streamlit's own widgets match the rest of the app automatically.
+#
+# These values are duplicated (deliberately) from the COLORS dict inside
+# app.py, since this file can't import Python - if you change COLORS, update
+# the matching values here too.
+
+[theme]
+base = "light"
+primaryColor = "#6d5ce8"           # COLORS["indigo"]      - accent for native widgets
+backgroundColor = "#f4f6fb"        # COLORS["app_bg"]      - page background
+secondaryBackgroundColor = "#ffffff"  # COLORS["card_bg"]  - widget/input background
+textColor = "#1f2430"              # COLORS["text_primary"]
+font = "sans serif"
+
+[client]
+# Hides Streamlit Cloud specific chrome (also reinforced with CSS in app.py's
+# inject_css(), which additionally removes the reserved blank space it left
+# behind even when "hidden").
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false
