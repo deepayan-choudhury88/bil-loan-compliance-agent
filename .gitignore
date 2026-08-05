@@ -4,6 +4,7 @@
 !.env.example
 pipeline/pipeline
 data/compliance_report.json
+data/compliance_report_meta.json
 __pycache__/
 .venv/
 venv/
