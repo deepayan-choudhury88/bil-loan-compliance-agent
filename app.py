@@ -1311,16 +1311,22 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
             unsafe_allow_html=True,
         )
     with page_col:
-        current_page = st.number_input(
-            "Page",
-            min_value=1,
-            max_value=total_pages,
-            value=st.session_state.page,
-            step=1,
-            label_visibility="collapsed",
-            key="page_input",
-            width=100,
-        )
+        # Right-align within this column so the control's right edge lines
+        # up with the "Rows" dropdown's right edge in the toolbar row above
+        # (both sit flush against the row's right edge). A width narrower
+        # than ~130px hides the number_input's +/- step buttons, so this
+        # stays a bit wider than the "Rows" selectbox itself.
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            current_page = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=total_pages,
+                value=st.session_state.page,
+                step=1,
+                label_visibility="collapsed",
+                key="page_input",
+                width=130,
+            )
         st.session_state.page = current_page
 
     if n_selected:
