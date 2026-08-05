@@ -347,16 +347,37 @@ def inject_css() -> None:
         }}
         .lcs-title {{ font-size: 26px; font-weight: 800; color: {c['text_primary']}; margin: 0; line-height: 1.1; }}
         .lcs-subtitle {{ color: {c['text_secondary']}; font-size: 12.5px; margin-top: 2px; }}
-        .lcs-report-meta {{ color: {c['text_secondary']}; font-size: 11.5px; margin: 2px 0 0 2px; }}
+        /* Report-freshness banner: rendered ABOVE the header card so it's
+           the very first thing a reviewer sees, not a small caption they
+           have to hunt for. Amber/warning tint (not the app's usual
+           indigo/blue) deliberately makes it stand out from everything
+           else on the page. */
+        .lcs-freshness-banner {{
+            background: {c['orange_soft']};
+            border: 1px solid #fcd9a0;
+            border-radius: 10px;
+            padding: 10px 18px;
+            margin-bottom: 10px;
+            font-size: 13.5px;
+            font-weight: 600;
+            color: {c['orange']};
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }}
+        .lcs-freshness-item {{ white-space: nowrap; }}
+        .lcs-freshness-sep {{ color: #e0b370; }}
+        .lcs-freshness-note {{ font-weight: 400; font-size: 12px; color: #a3701f; }}
         .lcs-pill {{
             display: inline-block; background: {c['indigo_soft']};
             border: 1px solid #cfc7fb; color: #4c3fb8;
             border-radius: 8px; padding: 8px 14px; font-weight: 600; font-size: 13.5px;
             white-space: nowrap;
         }}
-        /* Each stat chip (Total Audited / Failures / Remediated / FX Source)
-           is a flex item inside the header's horizontal container. flex:0 0
-           auto keeps it sized to its own content instead of being stretched
+        /* Each stat chip (Total Audited / Failures / Remediated) is a flex
+           item inside the header's horizontal container. flex:0 0 auto
+           keeps it sized to its own content instead of being stretched
            or shrunk by the flexbox - it just wraps onto a new line, as a
            whole unit, if the row runs out of width. */
         .lcs-stat-block {{ flex: 0 0 auto; white-space: nowrap; }}
@@ -981,6 +1002,45 @@ def reset_demo_data() -> None:
     generate_demo_loans.clear()  # drop the cached DataFrame for the old seed
 
 
+def render_report_freshness_banner() -> None:
+    """
+    A full-width banner announcing WHEN this report was generated and which
+    FX rate snapshot ("as of" date) was used - rendered ABOVE the header so
+    it's the very first thing on the page, not something a reviewer has to
+    go looking for.
+
+    Only shown when the portfolio actually came from a live pipeline run
+    (DATA_SOURCE_MODE == "custom", see load_data_from_custom_source()) -
+    demo/CSV data has no real generation time or FX snapshot to report, so
+    report_meta stays None and this is skipped entirely rather than showing
+    a misleading/fabricated timestamp.
+    """
+    report_meta = st.session_state.get("report_meta")
+    if not report_meta:
+        return
+
+    generated_display = str(report_meta.get("generated_at_utc", "unknown"))
+    try:
+        generated_dt = datetime.fromisoformat(generated_display.replace("Z", "+00:00"))
+        generated_display = generated_dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        pass
+    fx_date_display = str(report_meta.get("fx_rate_date") or "unknown")
+
+    st.markdown(
+        '<div class="lcs-freshness-banner">'
+        '<span class="lcs-freshness-item">🕒 <b>Report generated:</b> '
+        f"{html.escape(generated_display)}</span>"
+        '<span class="lcs-freshness-sep">|</span>'
+        '<span class="lcs-freshness-item">💱 <b>FX rates as of:</b> '
+        f"{html.escape(fx_date_display)}</span>"
+        '<span class="lcs-freshness-note">(FX providers only publish rates for market days - '
+        "this may not be today)</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 # =============================================================================
 # 10. HEADER
 #     The top bar: title, "OPA Rego + AI Agent" pill, live stats, and the
@@ -1058,11 +1118,6 @@ def render_header(df: pd.DataFrame) -> None:
             f'<div class="lcs-stat-value green">{remediated:,}</div></div>',
             unsafe_allow_html=True,
         )
-        st.markdown(
-            f'<div class="lcs-stat-block"><div class="lcs-stat-label">FX Source</div>'
-            f'<div class="lcs-stat-value blue" style="font-size:15px;">1 EUR = {FX_RATES["USD"]:.4f} USD</div></div>',
-            unsafe_allow_html=True,
-        )
 
         # -- action buttons ---------------------------------------------------
         # Import CSV / Reset 100k / Export Audit CSV sit directly in the same
@@ -1114,29 +1169,6 @@ def render_header(df: pd.DataFrame) -> None:
             type="primary",
             key="export_header_btn",
         )
-
-    # -- report generation / FX rate freshness -----------------------------
-    # Only shown when the portfolio actually came from a live pipeline run
-    # (DATA_SOURCE_MODE == "custom", see load_data_from_custom_source()) -
-    # demo/CSV data has no real generation time or FX snapshot to report,
-    # so report_meta stays None and this is skipped entirely rather than
-    # showing a misleading/fabricated timestamp.
-    report_meta = st.session_state.get("report_meta")
-    if report_meta:
-        generated_display = str(report_meta.get("generated_at_utc", "unknown"))
-        try:
-            generated_dt = datetime.fromisoformat(generated_display.replace("Z", "+00:00"))
-            generated_display = generated_dt.strftime("%Y-%m-%d %H:%M UTC")
-        except ValueError:
-            pass
-        fx_date_display = str(report_meta.get("fx_rate_date") or "unknown")
-        st.markdown(
-            f'<div class="lcs-report-meta">📄 Report generated: {html.escape(generated_display)}'
-            f' &nbsp;·&nbsp; 💱 FX rates as of {html.escape(fx_date_display)}'
-            f" (live rates don't always match today - providers only publish for market days)</div>",
-            unsafe_allow_html=True,
-        )
-
 
 # =============================================================================
 # 11. TAB 1: REVIEW WORKDESK
@@ -2002,6 +2034,7 @@ def main() -> None:
     init_session_state()
     portfolio_df = get_portfolio_data()
 
+    render_report_freshness_banner()
     render_header(portfolio_df)
 
     st.markdown('<div style="height:4px;"></div>', unsafe_allow_html=True)
