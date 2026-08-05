@@ -24,6 +24,7 @@ var countryToCurrency = map[string]string{
 }
 
 type ExchangeRates struct {
+	Date  string             `json:"date"`
 	Rates map[string]float64 `json:"rates"`
 }
 
@@ -106,18 +107,24 @@ type FailedLoan struct {
 	LoanDetails string
 }
 
-func fetchRates() (map[string]float64, error) {
+// fetchRates returns the latest EUR-based FX rates plus the "as of" date the
+// provider (frankfurter.dev) attaches to that snapshot - NOT necessarily
+// today's date, since FX providers only publish rates for market days (e.g.
+// a Monday morning run gets Friday's closing rates). We record this date in
+// the report metadata (see ReportMeta) so the UI can show reviewers exactly
+// which rates were used, instead of silently implying they're always fresh.
+func fetchRates() (map[string]float64, string, error) {
 	client := http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get("https://api.frankfurter.dev/v1/latest")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	var data ExchangeRates
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return data.Rates, nil
+	return data.Rates, data.Date, nil
 }
 
 func hasRule3Violation(violations []string) bool {
@@ -138,6 +145,19 @@ func violatesRule(violations []string, ruleLabel string) bool {
 // reportOutputPath is where the full per-loan report is written for the
 // Streamlit UI to read (see app.py's load_data_from_custom_source()).
 const reportOutputPath = "../data/compliance_report.json"
+
+// reportMetaOutputPath is a small sidecar file (read by app.py alongside
+// reportOutputPath) recording WHEN this report was generated and which FX
+// rate snapshot was used, so reviewers aren't left guessing how fresh the
+// numbers on screen are.
+const reportMetaOutputPath = "../data/compliance_report_meta.json"
+
+// ReportMeta is the sidecar metadata written next to the loan report.
+type ReportMeta struct {
+	GeneratedAtUTC string `json:"generated_at_utc"`
+	FXRateDate     string `json:"fx_rate_date"`
+	TotalLoans     int    `json:"total_loans"`
+}
 
 func callSuggestionAPI(client *http.Client, loan LoanInput) (*SuggestionResponse, error) {
 	apiURL := os.Getenv("SUGGESTION_API_URL")
@@ -176,7 +196,7 @@ func callSuggestionAPI(client *http.Client, loan LoanInput) (*SuggestionResponse
 }
 
 func main() {
-	rates, err := fetchRates()
+	rates, fxRateDate, err := fetchRates()
 	if err != nil {
 		log.Fatalf("Failed to fetch exchange rates: %v", err)
 	}
@@ -404,6 +424,20 @@ func main() {
 		log.Fatalf("Failed to write report: %v", err)
 	}
 	fmt.Printf("📄 Wrote %d loan records to %s (used by the Streamlit UI)\n", len(allLoans), reportOutputPath)
+
+	reportMeta := ReportMeta{
+		GeneratedAtUTC: time.Now().UTC().Format(time.RFC3339),
+		FXRateDate:     fxRateDate,
+		TotalLoans:     len(allLoans),
+	}
+	reportMetaJSON, err := json.MarshalIndent(reportMeta, "", "  ")
+	if err != nil {
+		log.Fatalf("Failed to encode report metadata: %v", err)
+	}
+	if err := os.WriteFile(reportMetaOutputPath, reportMetaJSON, 0o644); err != nil {
+		log.Fatalf("Failed to write report metadata: %v", err)
+	}
+	fmt.Printf("🕒 Report generated at %s UTC, using FX rates as of %s (%s)\n", reportMeta.GeneratedAtUTC, reportMeta.FXRateDate, reportMetaOutputPath)
 
 	fmt.Println("✅ Success! Compliance processing completed.")
 }
