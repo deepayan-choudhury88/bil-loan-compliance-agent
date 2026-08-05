@@ -976,7 +976,6 @@ def init_session_state() -> None:
     defaults = {
         "seed": 42,  # random seed for the demo data generator
         "loan_overrides": {},  # {loan_id: new_review_state}
-        "custom_df": None,  # holds an imported CSV, if any
         "selected_ids": set(),  # loan_ids checked in the Review Workdesk
         "page": 1,  # current page in the Review Workdesk table
         "last_active_section": NAV_REVIEW_WORKDESK,  # sticky nav selection - see main()
@@ -991,18 +990,11 @@ def init_session_state() -> None:
 def get_portfolio_data() -> pd.DataFrame:
     """
     Single entry point the rest of the app calls to get the current loan
-    portfolio. Resolution order:
-        1. A CSV imported this session via the header's "Import CSV" button
-           always wins (it's an explicit user action).
-        2. Otherwise, fall back to whatever DATA_SOURCE_MODE selects
-           ("demo", "csv", or "custom" - see the switch near the top of
-           this file).
-    Any in-session remediation actions are then layered on top.
+    portfolio: whatever DATA_SOURCE_MODE selects ("demo", "csv", or
+    "custom" - see the switch near the top of this file). Any in-session
+    remediation actions are then layered on top.
     """
-    if st.session_state.custom_df is not None:
-        base_df = st.session_state.custom_df
-        st.session_state.report_meta = None  # imported CSV has no pipeline-generation metadata
-    elif DATA_SOURCE_MODE == "csv":
+    if DATA_SOURCE_MODE == "csv":
         base_df = load_data_from_csv(CSV_DATA_PATH)
         st.session_state.report_meta = None
     elif DATA_SOURCE_MODE == "custom":
@@ -1060,10 +1052,14 @@ def render_report_freshness_banner() -> None:
 # =============================================================================
 # 10. HEADER
 #     The top bar: title, "OPA Rego + AI Agent" pill, live stats, and the
-#     Import / Reset / Export controls.
+#     Compliance Rules / Export controls.
 # =============================================================================
-def render_header(df: pd.DataFrame) -> None:
-    """Render the fixed header bar shown above all tabs."""
+def render_header(df: pd.DataFrame, show_export: bool = True) -> None:
+    """Render the fixed header bar shown above all tabs.
+
+    `show_export` controls whether the "Export Audit CSV" button appears -
+    it's only relevant on the Review Workdesk tab (see main()).
+    """
     total_audited = len(df)
     failing_mask = ~df["overall_pass"]
     unreviewed_failing = int((failing_mask & (df["review_state"] == "Unreviewed")).sum())
@@ -1136,43 +1132,20 @@ def render_header(df: pd.DataFrame) -> None:
         )
 
         # -- action buttons ---------------------------------------------------
-        # Import CSV / Export Audit CSV sit directly in the same outer
-        # container as everything else above (no nested sub-container). A
-        # nested st.container() defaults its own width to "stretch" - 100%
-        # of its parent - so wrapping these in their own inner container
-        # made THAT container claim a full line for itself and permanently
-        # push the buttons onto row 2, no matter how much room was free.
-        # Buttons/popovers default to a content-sized width instead, so left
-        # as direct children here they simply sit inline and wrap onto a new
-        # line only when the row actually runs out of space.
+        # These sit directly in the same outer container as everything else
+        # above (no nested sub-container). A nested st.container() defaults
+        # its own width to "stretch" - 100% of its parent - so wrapping them
+        # in their own inner container made THAT container claim a full
+        # line for itself and permanently push the buttons onto row 2, no
+        # matter how much room was free. Buttons/popovers default to a
+        # content-sized width instead, so left as direct children here they
+        # simply sit inline and wrap onto a new line only when the row
+        # actually runs out of space.
         #
-        # Neither of the two use use_container_width=True any more: that
-        # stretched each button to fill its (shrinking) st.columns() slot,
-        # which is what forced their labels to wrap letter-by-letter. Left
-        # at their natural content width, they simply wrap as a whole group
-        # when needed.
-        with st.popover("⬆️ Import CSV"):
-            st.caption(
-                "Upload a CSV previously exported from this app (or matching the "
-                "same columns) to replace the current portfolio."
-            )
-            uploaded_file = st.file_uploader(
-                "CSV file", type=["csv"], label_visibility="collapsed", key="csv_uploader"
-            )
-            if uploaded_file is not None:
-                try:
-                    imported_df = pd.read_csv(uploaded_file)
-                    missing_columns = [col for col in EXPORT_COLUMNS if col not in imported_df.columns]
-                    if missing_columns:
-                        st.error(f"Missing columns: {', '.join(missing_columns)}")
-                    else:
-                        st.session_state.custom_df = imported_df
-                        st.session_state.loan_overrides = {}
-                        st.success(f"Loaded {len(imported_df):,} loans.")
-                        st.rerun()
-                except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-                    st.error(f"Could not read CSV: {exc}")
-
+        # Neither uses use_container_width=True: that stretched each button
+        # to fill its (shrinking) st.columns() slot, which is what forced
+        # their labels to wrap letter-by-letter. Left at their natural
+        # content width, they simply wrap as a whole group when needed.
         with st.popover("📜 Compliance Rules"):
             st.caption("The three deterministic rules every loan is checked against (policy/compliance.rego).")
             for rule_key in ("R1", "R2", "R3"):
@@ -1181,14 +1154,18 @@ def render_header(df: pd.DataFrame) -> None:
                 st.markdown(rule["description"])
                 st.caption(f"If it fails: {rule['on_fail']}")
 
-        st.download_button(
-            "⬇️ Export Audit CSV",
-            data=dataframe_to_csv_bytes(df),
-            file_name=f"loan_compliance_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            type="primary",
-            key="export_header_btn",
-        )
+        # Export is only relevant on the Review Workdesk (the table it
+        # exports), so it's hidden on the other tabs - see show_export /
+        # main().
+        if show_export:
+            st.download_button(
+                "⬇️ Export Audit CSV",
+                data=dataframe_to_csv_bytes(df),
+                file_name=f"loan_compliance_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                type="primary",
+                key="export_header_btn",
+            )
 
 # =============================================================================
 # 11. TAB 1: REVIEW WORKDESK
@@ -1334,15 +1311,22 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
             unsafe_allow_html=True,
         )
     with page_col:
-        current_page = st.number_input(
-            "Page",
-            min_value=1,
-            max_value=total_pages,
-            value=st.session_state.page,
-            step=1,
-            label_visibility="collapsed",
-            key="page_input",
-        )
+        # Right-align within this column so the control's right edge lines
+        # up with the "Rows" dropdown's right edge in the toolbar row above
+        # (both sit flush against the row's right edge). A width narrower
+        # than ~130px hides the number_input's +/- step buttons, so this
+        # stays a bit wider than the "Rows" selectbox itself.
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            current_page = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=total_pages,
+                value=st.session_state.page,
+                step=1,
+                label_visibility="collapsed",
+                key="page_input",
+                width=130,
+            )
         st.session_state.page = current_page
 
     if n_selected:
@@ -1684,7 +1668,7 @@ def _render_report_metric_cards(df: pd.DataFrame) -> tuple:
     pass_rate_pct = passed / total * 100 if total else 0.0
     portfolio_value_eur = df["loan_value_eur"].sum()
 
-    card_cols = st.columns([1, 1, 1, 1, 0.9])
+    card_cols = st.columns(4)
     with card_cols[0]:
         st.markdown(
             f"""<div class="card">
@@ -1720,17 +1704,6 @@ def _render_report_metric_cards(df: pd.DataFrame) -> tuple:
                   <div class="card-sub">Fixed via AI Suggestions or Manual</div>
                 </div>""",
             unsafe_allow_html=True,
-        )
-    with card_cols[4]:
-        st.markdown('<div style="height:6px;"></div>', unsafe_allow_html=True)
-        st.download_button(
-            "📄 Export Full Audit Report CSV",
-            data=dataframe_to_csv_bytes(df),
-            file_name=f"loan_compliance_full_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            type="primary",
-            key="export_report_btn",
         )
 
     return total, passed, unresolved_failures, remediated, ignored, removed
@@ -1869,28 +1842,39 @@ def render_compliance_report(df: pd.DataFrame) -> None:
 # =============================================================================
 # 13. TAB 3: OPA REGO PLAYGROUND (illustrative demo, not a real OPA engine)
 # =============================================================================
-SAMPLE_REGO_POLICY = """package loan.compliance
+# The exact contents of policy/compliance.rego - the real OPA policy the Go
+# pipeline evaluates every loan against in "custom" mode. Shown here as the
+# default so reviewers can see (and experiment with) the actual rules, not
+# a fictional stand-in.
+SAMPLE_REGO_POLICY = """package compliance
 
-# Rule 1 - Min Value: pledged collateral must clear the floor value
-rule1_min_value {
-    input.loan.asset_value_eur >= data.thresholds.min_asset_value_eur
+import rego.v1
+
+# By default, a loan is not allowed unless it has zero violations.
+default allow := false
+
+allow if {
+    count(violations) == 0
 }
 
-# Rule 2 - Currency: loan must be denominated in an approved settlement currency
-rule2_currency {
-    input.loan.currency == data.approved_currencies[_]
+# Rule 1: Minimum loan value must be > 25,000 EUR
+violations contains msg if {
+    input.loan_value_eur <= 25000
+    msg := "Rule 1 Failed: Loan value is 25,000 EUR or less"
 }
 
-# Rule 3 - Asset Coverage: collateral must cover a minimum % of loan value
-rule3_asset_coverage {
-    coverage := (input.loan.asset_value_eur / input.loan.loan_value_eur) * 100
-    coverage >= data.thresholds.min_coverage_pct
+# Rule 2: Currency must match HQ Country
+# (Our Go pipeline will compute 'expected_currency' and pass it in)
+violations contains msg if {
+    input.loan_currency != input.expected_currency
+    msg := "Rule 2 Failed: Currency does not match HQ expected currency"
 }
 
-allow {
-    rule1_min_value
-    rule2_currency
-    rule3_asset_coverage
+# Rule 3: Asset coverage must be >= 50% of loan value
+# (No conversion needed here, they are in the same currency)
+violations contains msg if {
+    input.asset_value < (input.loan_value * 0.5)
+    msg := "Rule 3 Failed: Asset value is less than 50% of the loan value"
 }
 """
 
@@ -1939,9 +1923,9 @@ def render_opa_playground(df: pd.DataFrame) -> None:
         )
 
         if st.button("▶️ Evaluate policy", type="primary", key="eval_rego"):
-            rule1_present = "rule1_min_value" in policy_text
-            rule2_present = "rule2_currency" in policy_text
-            rule3_present = "rule3_asset_coverage" in policy_text
+            rule1_present = "Rule 1 Failed" in policy_text
+            rule2_present = "Rule 2 Failed" in policy_text
+            rule3_present = "Rule 3 Failed" in policy_text
 
             st.markdown("**Evaluation result:**")
             st.markdown(
@@ -1976,59 +1960,8 @@ def render_opa_playground(df: pd.DataFrame) -> None:
 
 
 # =============================================================================
-# 14. TAB 4: ASSET VALUE PREDICTOR (heuristic demo, NOT a trained ML model)
+# 15. MAIN ENTRY POINT
 # =============================================================================
-def render_asset_predictor(df: pd.DataFrame) -> None:
-    """
-    Render a lightweight heuristic 'predictor'.
-
-    NOTE: this is NOT a trained machine-learning model. It estimates a
-    plausible asset value from the average collateral-coverage ratio seen
-    for similar assets in the current portfolio, plus a small amount of
-    random noise for variety. Swap this out for a real model (e.g. a
-    scikit-learn/XGBoost regressor trained on historical appraisals) when
-    you have labelled training data.
-    """
-    st.markdown(
-        """
-        <div class="section-card">
-          <div class="section-title">Asset Value Predictor (ML)</div>
-          <div class="section-sub">Heuristic estimator based on portfolio statistics — enter asset details to get
-          a rough fair-value estimate. Demo only, not a production model.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    input_col, result_col = st.columns([1, 1.2])
-
-    with input_col:
-        asset_type = st.selectbox("Asset type", DEMO_ASSET_TYPES, key="pred_asset_type")
-        country = st.selectbox("Jurisdiction", DEMO_COUNTRIES, key="pred_country")
-        loan_value_eur = st.slider(
-            "Associated loan value (EUR)", 5_000, 20_000_000, 500_000, step=5_000, key="pred_loan_value"
-        )
-        run_prediction = st.button("🔮 Predict asset value", type="primary", key="predict_btn")
-
-    with result_col:
-        comparable_loans = df[df["asset_type"] == asset_type]
-        avg_coverage_pct = (
-            comparable_loans["coverage_pct"].mean() if len(comparable_loans) else df["coverage_pct"].mean()
-        )
-        if run_prediction:
-            # A small deterministic "noise" term so repeated predictions for
-            # the same inputs are stable, but different inputs vary a bit.
-            noise_factor = np.random.default_rng(hash(asset_type + country) % (2**32)).normal(1.0, 0.05)
-            predicted_value_eur = loan_value_eur * (avg_coverage_pct / 100.0) * noise_factor
-
-            st.metric("Predicted asset value", f"€{predicted_value_eur:,.0f}")
-            st.caption(
-                f"Based on {len(comparable_loans):,} comparable loans secured by similar assets "
-                f"(avg. coverage {avg_coverage_pct:.1f}%)."
-            )
-            confidence_pct = min(95, 60 + len(comparable_loans) / 500)
-            st.progress(confidence_pct / 100, text=f"Model confidence: {confidence_pct:.0f}%")
-        else:
-            st.info("Set the parameters and click **Predict asset value**.")
 
 
 # =============================================================================
@@ -2040,8 +1973,7 @@ def render_asset_predictor(df: pd.DataFrame) -> None:
 NAV_REVIEW_WORKDESK = "⚙️ Review Workdesk"
 NAV_COMPLIANCE_REPORT = "📊 Compliance & Portfolio Report"
 NAV_OPA_PLAYGROUND = "📄 OPA Rego Playground"
-NAV_ASSET_PREDICTOR = "🧠 Asset Value Predictor (ML)"
-NAV_OPTIONS = [NAV_REVIEW_WORKDESK, NAV_COMPLIANCE_REPORT, NAV_OPA_PLAYGROUND, NAV_ASSET_PREDICTOR]
+NAV_OPTIONS = [NAV_REVIEW_WORKDESK, NAV_COMPLIANCE_REPORT, NAV_OPA_PLAYGROUND]
 
 
 def main() -> None:
@@ -2071,7 +2003,11 @@ def main() -> None:
     portfolio_df = get_portfolio_data()
 
     render_report_freshness_banner()
-    render_header(portfolio_df)
+    # The header's visual slot is reserved here (top of the page) but only
+    # filled in below, once active_section is known - so the "Export Audit
+    # CSV" button can be shown/hidden based on which tab is active without
+    # moving the header itself lower on the page.
+    header_slot = st.container()
 
     st.markdown('<div style="height:4px;"></div>', unsafe_allow_html=True)
     active_section = st.segmented_control(
@@ -2089,14 +2025,15 @@ def main() -> None:
     active_section = st.session_state.last_active_section
     st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
+    with header_slot:
+        render_header(portfolio_df, show_export=(active_section == NAV_REVIEW_WORKDESK))
+
     if active_section == NAV_REVIEW_WORKDESK:
         render_review_workdesk(portfolio_df)
     elif active_section == NAV_COMPLIANCE_REPORT:
         render_compliance_report(portfolio_df)
-    elif active_section == NAV_OPA_PLAYGROUND:
-        render_opa_playground(portfolio_df)
     else:
-        render_asset_predictor(portfolio_df)
+        render_opa_playground(portfolio_df)
 
 
 if __name__ == "__main__":
