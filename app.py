@@ -1231,7 +1231,7 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
             )
         with bulk_ignore_col:
             st.button(
-                "🙈 Ignore",
+                "� Ignore",
                 use_container_width=True,
                 key="bulk_ignore",
                 on_click=_apply_bulk_action,
@@ -1254,7 +1254,7 @@ def _render_workdesk_status_bar(total_matches: int, failing_total: int, total_pa
 ACTION_PLACEHOLDER = "Review / Fix"
 ACTION_AI_SUGGEST = "🤖 AI Suggest"
 ACTION_REMEDIATE = "✅ Remediate"
-ACTION_IGNORE = "🙈 Ignore"
+ACTION_IGNORE = "� Ignore"
 ACTION_REMOVE = "🗑️ Remove"
 ROW_ACTION_OPTIONS = [ACTION_PLACEHOLDER, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
 ROW_ACTION_OPTIONS_RULE3 = [ACTION_PLACEHOLDER, ACTION_AI_SUGGEST, ACTION_REMEDIATE, ACTION_IGNORE, ACTION_REMOVE]
