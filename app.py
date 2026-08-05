@@ -53,6 +53,7 @@ from __future__ import annotations
 # -----------------------------------------------------------------------------
 # STANDARD LIBRARY IMPORTS
 # -----------------------------------------------------------------------------
+import html
 import io
 import json
 import os
@@ -843,6 +844,15 @@ def fmt_eur_millions(value_eur_total: float) -> str:
     return f"€{value_eur_total / 1e6:,.2f}M"
 
 
+def _truncate_at_word_boundary(text: str, max_len: int) -> str:
+    """Shorten `text` to at most `max_len` chars, breaking on a word boundary
+    instead of mid-word, appending '…' if anything was cut."""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rsplit(" ", 1)[0]
+    return (cut or text[:max_len]) + "…"
+
+
 def status_pill_html(review_state: str) -> str:
     """Return a coloured HTML 'pill' badge for a given review_state value."""
     style_by_state = {
@@ -1412,15 +1422,24 @@ def _render_workdesk_row(row: pd.Series) -> None:
         ai_hint_html = ""
         on_demand_suggestion = st.session_state.ai_suggestions.get(loan_id)
         if on_demand_suggestion is not None:
+            # The full reason can be a long, fully-explanatory sentence (loan
+            # value, threshold, shortfall, recommended alternative - see
+            # retrieval/suggestion_agent.py). Truncating it hard at a fixed
+            # character count cut it off mid-word/mid-sentence, which read as
+            # broken rather than just shortened. Instead: truncate at a word
+            # boundary for the visible summary, and put the FULL reason in a
+            # `title` tooltip (hover) so nothing is actually lost.
+            reason = str(on_demand_suggestion.get("reason", "")).strip()
+            reason_title_attr = f' title="{html.escape(reason)}"' if reason else ""
             if on_demand_suggestion.get("status") == "success":
                 ai_hint_html = (
-                    f'<div class="row-ai-suggestion">💡 AI suggests: '
+                    f'<div class="row-ai-suggestion"{reason_title_attr}>💡 AI suggests: '
                     f'{on_demand_suggestion.get("suggested_asset")}</div>'
                 )
             else:
-                reason = str(on_demand_suggestion.get("reason", "No suitable alternative found."))
-                short_reason = reason if len(reason) <= 90 else reason[:88] + "…"
-                ai_hint_html = f'<div class="row-ai-suggestion">💡 AI: {short_reason}</div>'
+                reason = reason or "No suitable alternative found."
+                short_reason = _truncate_at_word_boundary(reason, max_len=140)
+                ai_hint_html = f'<div class="row-ai-suggestion" title="{html.escape(reason)}">💡 AI: {short_reason}</div>'
         elif row["rule1_pass"] and not row["rule3_pass"] and row.get("ai_suggested_asset"):
             # No point suggesting a substitute asset for a loan that's out of
             # scope anyway due to a Rule 1 failure (see the value-cell hint above).
