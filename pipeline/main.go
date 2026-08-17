@@ -113,8 +113,34 @@ type FailedLoan struct {
 // a Monday morning run gets Friday's closing rates). We record this date in
 // the report metadata (see ReportMeta) so the UI can show reviewers exactly
 // which rates were used, instead of silently implying they're always fresh.
+//
+// Retries a few times with backoff before giving up - a single transient
+// network blip (flaky Wi-Fi, VPN hiccup, DNS retry) shouldn't hard-fail an
+// entire pipeline run.
 func fetchRates() (map[string]float64, string, error) {
 	client := http.Client{Timeout: 10 * time.Second}
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		rates, date, err := doFetchRates(&client)
+		if err == nil {
+			return rates, date, nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			backoff := time.Duration(attempt) * 2 * time.Second
+			fmt.Printf("⚠️  FX rate fetch attempt %d/%d failed (%v) - retrying in %s...\n", attempt, maxAttempts, err, backoff)
+			time.Sleep(backoff)
+		}
+	}
+	return nil, "", fmt.Errorf(
+		"%w (after %d attempts - check your network/VPN/firewall; try "+
+			"`curl https://api.frankfurter.dev/v1/latest` directly to confirm connectivity)",
+		lastErr, maxAttempts,
+	)
+}
+
+func doFetchRates(client *http.Client) (map[string]float64, string, error) {
 	resp, err := client.Get("https://api.frankfurter.dev/v1/latest")
 	if err != nil {
 		return nil, "", err
