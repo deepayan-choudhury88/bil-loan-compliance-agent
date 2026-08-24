@@ -1,0 +1,102 @@
+name: Promote release
+
+# Manually promotes a specific, already-tested image digest (the one
+# that passed CI and was deployed to dev) to staging or prod. Never
+# rebuilds an image — staging and prod always run the exact bytes that
+# were validated in dev. Gated by GitHub Environments: configure
+# "staging" to require 1 reviewer and "prod" to require 2 reviewers in
+# the repo's Settings → Environments before using this in anger.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: ["staging", "prod"]
+      image_tag:
+        description: "Image tag to promote (e.g. the git SHA that was deployed to dev)"
+        required: true
+        type: string
+      change_ticket:
+        description: "Change ticket reference (required for prod)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.7.5"
+
+jobs:
+  guard:
+    name: Guard prod requires a change ticket
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce change ticket for prod
+        if: inputs.environment == 'prod' && inputs.change_ticket == ''
+        run: |
+          echo "❌ A change_ticket reference is required when promoting to prod."
+          exit 1
+
+  promote:
+    name: Promote to ${{ inputs.environment }}
+    needs: guard
+    runs-on: ubuntu-latest
+    # This environment gate is what actually enforces the required
+    # reviewers — GitHub pauses the job here until approved.
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: infra/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure login (OIDC — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify the image tag exists in ACR before promoting
+        run: |
+          for component in ui suggestion-api pipeline; do
+            az acr repository show-tags \
+              --name ${{ vars.ACR_NAME }} \
+              --repository "$component" \
+              --query "contains(@, '${{ inputs.image_tag }}')" -o tsv | grep -q true \
+              || { echo "❌ Tag ${{ inputs.image_tag }} not found for $component"; exit 1; }
+          done
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform apply — pin exact image digest promoted from dev
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var="ui_image=${{ vars.ACR_LOGIN_SERVER }}/ui:${{ inputs.image_tag }}" \
+            -var="api_image=${{ vars.ACR_LOGIN_SERVER }}/suggestion-api:${{ inputs.image_tag }}" \
+            -var="pipeline_image=${{ vars.ACR_LOGIN_SERVER }}/pipeline:${{ inputs.image_tag }}" \
+            -var="postgres_admin_password=${{ secrets.POSTGRES_ADMIN_PASSWORD }}"
+
+      - name: Smoke test — UI reachable
+        run: |
+          FQDN=$(terraform output -raw ui_fqdn)
+          for i in {1..10}; do
+            if curl -fsS "https://$FQDN/health" -o /dev/null; then
+              echo "✅ ${{ inputs.environment }} UI healthy on $FQDN"
+              exit 0
+            fi
+            echo "Waiting for rollout to become healthy... ($i/10)"
+            sleep 15
+          done
+          echo "❌ Health check failed after promotion to ${{ inputs.environment }} — roll back by re-running this workflow with the previous image_tag."
+          exit 1

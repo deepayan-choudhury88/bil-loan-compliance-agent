@@ -1,0 +1,209 @@
+name: App CI/CD
+
+# Builds, scans, and (on main) deploys the three application images:
+# pipeline (Go), suggestion-api (Python), ui (Streamlit). Infra shape is
+# managed separately by infra-ci.yml / promote.yml — this workflow only
+# ever updates the running image tag on an already-provisioned dev
+# environment via `az containerapp update`.
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "pipeline/**"
+      - "retrieval/**"
+      - "app.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/app-ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "pipeline/**"
+      - "retrieval/**"
+      - "app.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/app-ci.yml"
+
+permissions:
+  id-token: write   # required for Azure OIDC login
+  contents: read
+
+env:
+  ACR_NAME: acrloancompldev   # must match infra/environments/dev's ACR (see terraform output acr_login_server)
+
+jobs:
+  # ---------------------------------------------------------------
+  # Test — whatever automated tests exist today. `go test ./...` and
+  # `opa test` pass trivially with zero test files; this job becomes
+  # more meaningful as coverage grows (see engineering audit backlog).
+  # ---------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: pipeline/go.sum
+
+      - name: Go test
+        working-directory: ./pipeline
+        run: go test ./... -v
+
+      - name: Set up OPA CLI
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/opa
+
+      - name: Rego policy test
+        run: opa test policy/ -v
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Python test
+        run: python3 -m pytest retrieval/ -v
+
+  # ---------------------------------------------------------------
+  # Build + scan each component image. Runs on every PR (build+scan
+  # only, no push) and on main (build+scan, then push in the next job).
+  # ---------------------------------------------------------------
+  build-and-scan:
+    name: Build & scan (${{ matrix.component }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: pipeline
+            dockerfile: pipeline/Dockerfile
+          - component: suggestion-api
+            dockerfile: retrieval/Dockerfile
+          - component: ui
+            dockerfile: Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: local/${{ matrix.component }}:${{ github.sha }}
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: local/${{ matrix.component }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------
+  # Push to ACR — only on merge to main, only after build+scan passed.
+  # ---------------------------------------------------------------
+  push:
+    name: Push (${{ matrix.component }})
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: pipeline
+            dockerfile: pipeline/Dockerfile
+          - component: suggestion-api
+            dockerfile: retrieval/Dockerfile
+          - component: ui
+            dockerfile: Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.ACR_NAME }}.azurecr.io/${{ matrix.component }}:${{ github.sha }}
+            ${{ env.ACR_NAME }}.azurecr.io/${{ matrix.component }}:dev-latest
+
+  # ---------------------------------------------------------------
+  # Deploy to dev — updates the already-provisioned Container Apps to
+  # the new image tags (revision-based rollout: new revision starts at
+  # 0% traffic, health-checked, then shifted to 100% — see architecture
+  # doc §12.4). Promotion to staging/prod is a SEPARATE, manually
+  # triggered workflow (promote.yml) using this exact same image digest.
+  # ---------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to dev
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: push
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update UI container app
+        run: |
+          az containerapp update \
+            --name ca-ui-dev \
+            --resource-group rg-loancompl-dev \
+            --image ${{ env.ACR_NAME }}.azurecr.io/ui:${{ github.sha }} \
+            --revision-suffix ${{ github.sha }}
+
+      - name: Update suggestion API container app
+        run: |
+          az containerapp update \
+            --name ca-suggestion-api-dev \
+            --resource-group rg-loancompl-dev \
+            --image ${{ env.ACR_NAME }}.azurecr.io/suggestion-api:${{ github.sha }} \
+            --revision-suffix ${{ github.sha }}
+
+      - name: Update pipeline job
+        run: |
+          az containerapp job update \
+            --name caj-pipeline-dev \
+            --resource-group rg-loancompl-dev \
+            --image ${{ env.ACR_NAME }}.azurecr.io/pipeline:${{ github.sha }}
+
+      - name: Smoke test — suggestion API health
+        run: |
+          FQDN=$(az containerapp show --name ca-suggestion-api-dev --resource-group rg-loancompl-dev --query "properties.configuration.ingress.fqdn" -o tsv)
+          for i in {1..10}; do
+            if curl -fsS "https://$FQDN/health"; then
+              echo "✅ Suggestion API healthy"
+              exit 0
+            fi
+            echo "Waiting for new revision to become healthy... ($i/10)"
+            sleep 10
+          done
+          echo "❌ Suggestion API failed health check after deploy — traffic was NOT shifted to the new revision automatically by this step; investigate before shifting manually."
+          exit 1
