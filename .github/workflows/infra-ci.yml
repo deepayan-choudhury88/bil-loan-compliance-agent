@@ -1,0 +1,135 @@
+name: Infra CI (Terraform)
+
+# Validates and plans Terraform changes on every PR touching infra/, and
+# automatically applies to the dev environment on merge to main.
+# Staging/prod are NEVER touched by this workflow — see promote.yml.
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-ci.yml"
+
+permissions:
+  id-token: write      # required for Azure OIDC login
+  contents: read
+  pull-requests: write # required to post the plan as a PR comment
+
+env:
+  TF_VERSION: "1.7.5"
+
+jobs:
+  # ---------------------------------------------------------------
+  # fmt + validate + plan — runs for every environment directory so a
+  # single PR shows the full blast radius across dev/staging/prod.
+  # ---------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: infra/environments/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive ../../
+
+      - name: Azure login (OIDC — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        id: plan
+        # Non-secret image tags default to each environment's current
+        # "-latest" tag; the actual promoted digest is pinned explicitly
+        # by promote.yml for staging/prod. Secrets come from GitHub
+        # Environment secrets scoped to this environment name.
+        run: |
+          terraform plan -no-color -input=false \
+            -var="ui_image=${{ vars.ACR_LOGIN_SERVER }}/ui:${{ matrix.environment }}-latest" \
+            -var="api_image=${{ vars.ACR_LOGIN_SERVER }}/suggestion-api:${{ matrix.environment }}-latest" \
+            -var="pipeline_image=${{ vars.ACR_LOGIN_SERVER }}/pipeline:${{ matrix.environment }}-latest" \
+            -var="postgres_admin_password=${{ secrets.POSTGRES_ADMIN_PASSWORD }}" \
+            -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+        continue-on-error: true
+
+      - name: Post plan as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/environments/${{ matrix.environment }}/plan.txt', 'utf8').slice(0, 60000);
+            const body = `#### Terraform Plan — \`${{ matrix.environment }}\`\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # ---------------------------------------------------------------
+  # Apply to dev only, only on merge to main. Staging/prod are always
+  # manual via promote.yml.
+  # ---------------------------------------------------------------
+  apply-dev:
+    name: Apply (dev)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: infra/environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform apply
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var="ui_image=${{ vars.ACR_LOGIN_SERVER }}/ui:dev-latest" \
+            -var="api_image=${{ vars.ACR_LOGIN_SERVER }}/suggestion-api:dev-latest" \
+            -var="pipeline_image=${{ vars.ACR_LOGIN_SERVER }}/pipeline:dev-latest" \
+            -var="postgres_admin_password=${{ secrets.POSTGRES_ADMIN_PASSWORD }}"
